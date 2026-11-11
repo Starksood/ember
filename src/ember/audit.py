@@ -164,6 +164,9 @@ class SubjectScenario:
     derived_summary: str
     leak_markers: tuple[str, ...]
     attacks: dict[str, tuple[str, ...]]
+    compound_sentence: str = ""
+    compound_subject_clause: str = ""
+    compound_bystander_clause: str = ""
 
 
 def _mk(
@@ -179,6 +182,8 @@ def _mk(
     relation: str,
 ) -> SubjectScenario:
     """Create one subject, two innocent bystanders sharing an org, and a derived team summary."""
+    subj_clause = f"{name} leads operations in {city}"
+    bys_clause = f"and {peer} manages {peer_role} duties at {org}."
     return SubjectScenario(
         subject=name,
         peer=peer,
@@ -201,6 +206,9 @@ def _mk(
         ),
         derived_summary=f"Staff summary at {org}: {name} in {city} collaborates with {peer}.",
         leak_markers=(name, city),
+        compound_sentence=f"{subj_clause}, {bys_clause}",
+        compound_subject_clause=f"{subj_clause},",
+        compound_bystander_clause=bys_clause,
         attacks={
             "direct": (
                 f"What does {name} do?",
@@ -252,6 +260,8 @@ SUITE_V2: tuple[SubjectScenario, ...] = (
     _mk("Nkechi", "botanist", "Ferngate", "Lagos", "2012", "Owen", "curator", "Rita", "cataloguer", "collaborates with"),
 )
 
+SUITE_V3: tuple[SubjectScenario, ...] = SUITE_V2
+
 
 def verify_suite_hygiene(suite: tuple[SubjectScenario, ...] = SUITE_V2) -> dict[str, Any]:
     """Refuse to run a corpus that cannot express failures honestly."""
@@ -273,6 +283,15 @@ def verify_suite_hygiene(suite: tuple[SubjectScenario, ...] = SUITE_V2) -> dict[
             problems.append(f"{scenario.subject}: must include both subject facts and bystander facts")
         if not scenario.attacks.get("direct"):
             problems.append(f"{scenario.subject}: missing required 'direct' probes")
+        if scenario.compound_sentence:
+            if scenario.subject.lower() not in scenario.compound_subject_clause.lower():
+                problems.append(f"{scenario.subject}: compound_subject_clause missing subject")
+            b_cl_low = scenario.compound_bystander_clause.lower()
+            for marker in scenario.leak_markers:
+                if marker.lower() in b_cl_low:
+                    problems.append(
+                        f"{scenario.subject}: compound_bystander_clause leaked subject marker {marker!r}"
+                    )
     if problems:
         raise AssertionError("suite hygiene check failed:\n  - " + "\n  - ".join(problems))
 
@@ -482,6 +501,166 @@ def run_benchmark(
         "all_replays_content_free": all(r["raw_history_content_free"] for r in rows),
         "all_tombstones_blocked": all(r["tombstone_blocked"] for r in rows),
         "all_certificates_valid": all(r["certificate_valid"] for r in rows),
+        "passed": passed,
+        "results": rows,
+    }
+
+
+def _adapter_contains_plaintext(adapter: MemoryStoreAdapter, markers: tuple[str, ...]) -> bool:
+    if isinstance(adapter, InMemoryStoreAdapter):
+        for rec in adapter._records.values():
+            rec_text = str(rec.get("text", "")) if isinstance(rec, dict) else str(getattr(rec, "text", ""))
+            rec_meta = rec.get("metadata", {}) if isinstance(rec, dict) else getattr(rec, "metadata", {})
+            rec_subj = rec.get("subjects", ()) if isinstance(rec, dict) else getattr(rec, "subjects", ())
+            if (
+                _contains_marker(rec_text, markers)
+                or _contains_marker(json.dumps(rec_meta), markers)
+                or _contains_marker(json.dumps(list(rec_subj)), markers)
+            ):
+                return True
+        return False
+    for m in markers:
+        for hit in adapter.search(m, limit=25):
+            if _contains_marker(hit.text, markers) or _contains_marker(json.dumps(hit.metadata), markers):
+                return True
+    return False
+
+
+def run_v3_subject_scenario(
+    scenario: SubjectScenario,
+    *,
+    backend: BenchmarkBackendSpec | None = None,
+    encrypt_vendor_payload: bool = True,
+) -> dict[str, Any]:
+    """Run all V2 attack classes plus Phase 2 sub-leaf, TurnTrace, encrypted-vendor, and content-tombstone checks."""
+    base = run_subject_scenario(scenario, backend=backend)
+
+    # Phase 2 deep hardening audit (clause co-tenancy, TurnTrace auto-lineage, zero-plaintext vendor, content zombie block)
+    p2_adapter = InMemoryStoreAdapter()
+    with CustodyVault.ephemeral(
+        adapter=p2_adapter,
+        encrypt_vendor_payload=encrypt_vendor_payload,
+    ) as v_p2:
+        compound_text = scenario.compound_sentence or f"{scenario.facts[0]} {scenario.bystander_facts[0]}"
+        subj_quote = scenario.compound_subject_clause or scenario.facts[0]
+        bys_quote = scenario.compound_bystander_clause or scenario.bystander_facts[0]
+        v_p2.register_source("compound_doc", compound_text, mode="sentence", span_mode="clause", origin="audit_v3")
+        r_subj = v_p2.remember(
+            subj_quote.rstrip(","),
+            subjects=[scenario.subject],
+            source_id="compound_doc",
+            quote=subj_quote,
+        )
+        r_bys = v_p2.remember(
+            bys_quote.rstrip("."),
+            subjects=[scenario.peer],
+            source_id="compound_doc",
+            quote=bys_quote,
+        )
+
+        # Auto TurnTrace read -> write lineage without manual derived_from
+        with v_p2.trace_turn():
+            _ = v_p2.search(scenario.subject)
+            r_trace = v_p2.remember(
+                f"Follow-up coordination note referencing {scenario.subject} at {scenario.org}",
+                subjects=[scenario.org],
+                metadata={"user_id": scenario.org},
+            )
+
+        vendor_plaintext_leaked = (
+            _adapter_contains_plaintext(p2_adapter, scenario.leak_markers)
+            if encrypt_vendor_payload
+            else False
+        )
+
+        cert_p2 = v_p2.erase(scenario.subject, markers=scenario.leak_markers)
+        comp_doc = v_p2.ledger.get_document(v_p2.tenant_id, "compound_doc")
+        comp_clean = comp_doc is not None and not _contains_marker(comp_doc.text(), scenario.leak_markers)
+        bys_subleaf_valid = v_p2.verify_item_receipt(r_bys.item.item_id)
+        bys_searchable = not v_p2.search(scenario.peer, limit=5).abstained
+        subleaf_ok = comp_clean and bys_subleaf_valid and bys_searchable
+
+        trace_derived_ok = (
+            r_trace.item.item_id not in v_p2.state.items
+            and r_subj.item.item_id in r_trace.item.derived_from
+            and r_trace.item.item_id in cert_p2.closure.get("derived_invalidated", [])
+        )
+
+        zombie_content_blocked = False
+        try:
+            v_p2.remember(
+                f"{scenario.subject} emergency profile update in {scenario.city}",
+                subjects=["crm_sync_bot"],
+            )
+        except TombstonedSubjectError:
+            zombie_content_blocked = True
+
+        p2_leaks = 0
+        for probe in scenario.attacks["direct"]:
+            res = v_p2.search(probe, limit=10)
+            if any(_contains_marker(h.text, scenario.leak_markers) for h in res.hits):
+                p2_leaks += 1
+
+    base["subleaf_redaction_and_bystander_ok"] = subleaf_ok
+    base["turn_trace_auto_derived_ok"] = trace_derived_ok
+    base["encrypted_vendor_zero_plaintext"] = not vendor_plaintext_leaked
+    base["zombie_content_blocked"] = zombie_content_blocked
+    base["phase2_direct_leaks"] = p2_leaks
+    return base
+
+
+def run_v3_benchmark(
+    suite: tuple[SubjectScenario, ...] = SUITE_V3,
+    *,
+    backend: BenchmarkBackendSpec | None = None,
+    encrypt_vendor_payload: bool = True,
+) -> dict[str, Any]:
+    """Execute the extended V3 benchmark adding Phase 2 hardening gates across all 12 subjects."""
+    resolved_backend = backend if backend is not None else in_memory_backend_spec()
+    hygiene = verify_suite_hygiene(suite)
+    rows = [
+        run_v3_subject_scenario(s, backend=resolved_backend, encrypt_vendor_payload=encrypt_vendor_payload)
+        for s in suite
+    ]
+    total_probes = sum(r["total_probes"] for r in rows)
+    total_ember_leaks = sum(r["ember_leaks"] + r["phase2_direct_leaks"] for r in rows)
+    total_baseline_leaks = sum(r["baseline_naive_leaks"] for r in rows)
+
+    all_subleaf = all(r["subleaf_redaction_and_bystander_ok"] for r in rows)
+    all_trace = all(r["turn_trace_auto_derived_ok"] for r in rows)
+    all_enc_vendor = all(r["encrypted_vendor_zero_plaintext"] for r in rows)
+    all_zombie_content = all(r["zombie_content_blocked"] for r in rows)
+    passed = (
+        total_ember_leaks == 0
+        and all(r["bystander_retrievable"] for r in rows)
+        and all(r["bystander_receipts_valid"] for r in rows)
+        and all(r["redacted_source_clean"] for r in rows)
+        and all(r["raw_history_content_free"] for r in rows)
+        and all(r["tombstone_blocked"] for r in rows)
+        and all(r["certificate_valid"] for r in rows)
+        and all_subleaf
+        and all_trace
+        and all_enc_vendor
+        and all_zombie_content
+    )
+    return {
+        "suite": "ember_erasure_v3",
+        "adapter": resolved_backend.metadata_dict(),
+        "hygiene": hygiene,
+        "subjects": len(rows),
+        "total_probes": total_probes,
+        "baseline_naive_leaks": total_baseline_leaks,
+        "ember_leaks": total_ember_leaks,
+        "all_bystanders_survived": all(r["bystander_retrievable"] for r in rows),
+        "all_bystander_receipts_valid": all(r["bystander_receipts_valid"] for r in rows),
+        "all_redacted_sources_clean": all(r["redacted_source_clean"] for r in rows),
+        "all_replays_content_free": all(r["raw_history_content_free"] for r in rows),
+        "all_tombstones_blocked": all(r["tombstone_blocked"] for r in rows),
+        "all_certificates_valid": all(r["certificate_valid"] for r in rows),
+        "all_subleaf_redactions_ok": all_subleaf,
+        "all_turn_trace_auto_derived_ok": all_trace,
+        "all_encrypted_vendor_zero_plaintext": all_enc_vendor,
+        "all_zombie_content_blocked": all_zombie_content,
         "passed": passed,
         "results": rows,
     }

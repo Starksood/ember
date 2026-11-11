@@ -2,22 +2,32 @@
 
 > **Proof that survives erasure.** Cryptographic custody, redactable Merkle provenance receipts, and adversarially tested cascade deletion for AI memory and RAG stores.
 
-Existing memory engines (`Mem0`, `Letta`, `LangChain`, vector databases) know how to store embeddings and delete by top-level `user_id`. Under GDPR Article 17 ("Right to be Forgotten") and enterprise audit requirements, three failures still happen silently:
+Existing memory engines (`Mem0`, `Qdrant`, `Chroma`, `pgvector`, `Pinecone`, `LangChain`, `LlamaIndex`) know how to store embeddings and delete by top-level `user_id`. Under GDPR Article 17 ("Right to be Forgotten") and enterprise audit requirements, three failures still happen silently:
 
-1. **The Erasure / Receipt Trilemma:** If two subjects appear in the same source transcript, a flat SHA-256 document hash forces an impossible choice: delete Subject A cleanly and break Bystander B's provenance receipt, or preserve B's receipt by leaving A's source file unredacted.
-2. **Derived & Cross-Bucket Leaks:** Calling `delete_all(user_id="priya")` deletes raw memories keyed to `"priya"`, leaving downstream derived team summaries, shared workspace notes, and append-only audit logs surfacing `"Priya"` forever.
-3. **Zombie Re-Ingestion & Fake Metrics:** Sync retries re-ingest erased subjects seconds later; naive deletion metrics pass `0 leaks` trivially if a system wipes bystander data along with the subject.
+1. **The Erasure / Receipt Trilemma:** If two subjects appear in the same source transcript (or even the same compound sentence), a flat SHA-256 document hash forces an impossible choice: delete Subject A cleanly and break Bystander B's provenance receipt, or preserve B's receipt by leaving A's source file unredacted.
+2. **Derived & Cross-Bucket Leaks:** Calling `delete_all(user_id="priya")` deletes raw memories keyed to `"priya"`, leaving downstream turn-derived team summaries, shared workspace notes, and append-only audit logs surfacing `"Priya"` forever.
+3. **Zombie Re-Ingestion & Fake Metrics:** Sync retries or un-tagged follow-up writes re-ingest erased subjects seconds later; naive deletion metrics pass `0 leaks` trivially if a system wipes bystander data along with the subject.
 
-**Ember** wraps your existing memory or vector store (~10 lines of Python) to solve all three with explicit, falsifiable cryptographic mechanisms.
+**Ember** wraps your existing memory, vector DB, framework retriever, HTTP service, or MCP agent pipeline to solve all three with explicit, falsifiable cryptographic mechanisms.
 
 ---
 
 ## Core Guarantees
 
-- **Redactable Salted Merkle Provenance (`ember.merkle`, `ember.receipts`):** Documents split into sentence/line/custom leaves with length-prefixed per-leaf 128-bit random nonces (`0x00 || len32(nonce) || nonce || leaf_bytes`, RFC 6962 domain separation). Erasing Subject A destroys A's plaintext and nonce while keeping A's leaf digest so **Bystander B's inclusion proof still verifies** against the unchanged Merkle root — while offline dictionary guessing of A's redacted leaf fails.
-- **Zero-Plaintext Hash-Chained Ledger + Crypto-Shredding (`ember.ledger`, `ember.crypto`, `ember.keystore`):** Append-only SQLite WAL chain (`synchronous=FULL`) encrypts `subjects`, `text`, `quote`, and caller `metadata` with `AES-256-GCM` bound via AAD to `(tenant, item_id, field, key_ref)`. Shared and `derived_from` records use tracked per-record keys linked to every upstream contributor — erasing any contributor destroys both their subject CEK and every shared/derived DEK before issuing external adapter calls, so from-zero replay produces `[erased]` even across transient store timeouts.
-- **Keyed Tombstones & Fail-Closed Certificates (`ember.reducer`, `ember.signing`):** Vault-keyed HMAC-SHA256 tombstones block re-ingestion (`TombstonedSubjectError`) unless an explicit `reconsent_id` is supplied. `erase()` probes the **raw wrapped store directly** and raises `ErasureIncomplete` without issuing an Ed25519 certificate if anything still surfaces.
-- **Zero-Dependency Offline Verifier (`ember/verify.py`):** Copy this single Python stdlib file anywhere to verify Merkle redactions, bystander receipts, and ledger hash chains without third-party packages (`cryptography` is used only when checking Ed25519 certificate signatures).
+- **Redactable Salted Merkle Provenance — Leaf & Sub-Leaf (`ember.merkle`, `ember.receipts`):** Documents split into sentence/line/custom leaves—and optionally compound `span_mode="word" | "clause"` sub-leaves—with length-prefixed per-node 128-bit random nonces (`0x00 || len32(nonce) || nonce || leaf_bytes`, RFC 6962 domain separation). Erasing Subject A destroys A's plaintext and nonce while keeping A's salted digest so **Bystander B's inclusion proof still verifies** even inside the exact same compound sentence.
+- **Automatic Turn-Scoped Lineage & Zero-Plaintext Vendor Storage (`ember.vault`, `ember.adapters`):**
+  - `vault.trace_turn()` automatically tracks reads -> `derived_from` writes within an agent turn (`prune="all" | "lexical_overlap" | callable`) without manual wiring.
+  - `encrypt_vendor_payload=True` sends AES-256-GCM ciphertext and opaque HMAC `subject_ref` filters (with your `embedder` or keyed HMAC blind-index search tokens) so third-party vector DBs never hold plaintext PII.
+- **Hash-Chained Ledger, Signed Checkpoints & Enterprise KMS (`ember.ledger`, `ember.keystore`, `ember.kms`):**
+  - Append-only `SQLiteLedger` (`WAL`, `synchronous=FULL`) or `PostgresLedger` encrypts `subjects`, `text`, `quote`, and caller `metadata` with `AES-256-GCM` bound via AAD to `(tenant, item_id, field, key_ref)`.
+  - Ed25519-signed ciphertext-only `checkpoints` support `O(delta)` startup without writing plaintext to snapshots.
+  - Key management spans `FileKeyStore`, `SQLiteKeyStore` (`PRAGMA secure_delete=ON`), and envelope-wrapped KMS (`AwsKmsKeyStore`, `GcpKmsKeyStore`, `VaultTransitKeyStore`).
+- **Keyed Content Tombstones, Fail-Closed Certificates & External Anchoring (`ember.reducer`, `ember.signing`):**
+  - Vault-keyed HMAC-SHA256 subject and content tombstones block silent/un-tagged zombie re-ingestion (`TombstonedSubjectError`) unless an explicit `reconsent_id` is supplied.
+  - `erase()` synthesizes `auto_probes` alongside caller `probes`, queries the **raw wrapped store**, raises `ErasureIncomplete` if any residue remains, signs an `Ed25519` certificate, and optionally anchors digests to RFC 3161 TSAs (`Rfc3161Anchor`) or Sigstore Rekor (`RekorAnchor`).
+- **Offline Verifier & Air-Gapped Compliance Dossier (`ember/verify.py`, `ember/report.py`):**
+  - Copy [`src/ember/verify.py`](src/ember/verify.py) anywhere to verify Merkle redactions, bystander receipts, and ledger hash chains using Python's standard library alone (`python3 -S`).
+  - Render self-contained zero-CDN HTML compliance dossiers with `ember verify bundle.json --html report.html`.
 
 ---
 
@@ -27,10 +37,19 @@ Existing memory engines (`Mem0`, `Letta`, `LangChain`, vector databases) know ho
 pip install ember-custody
 ```
 
-Optional Mem0 extra:
+Optional extras for your stack:
 
 ```bash
-pip install "ember-custody[mem0]"
+pip install "ember-custody[mem0]"       # Mem0 wrapper + adapter
+pip install "ember-custody[qdrant]"     # Qdrant native adapter
+pip install "ember-custody[chroma]"     # Chroma native adapter
+pip install "ember-custody[postgres]"   # PostgresLedger & PgVectorAdapter (psycopg3)
+pip install "ember-custody[pinecone]"   # Pinecone native adapter
+pip install "ember-custody[langchain]"  # EmberLangChainRetriever / VectorStore
+pip install "ember-custody[llamaindex]" # EmberLlamaIndexRetriever
+pip install "ember-custody[aws]"        # AwsKmsKeyStore (boto3)
+pip install "ember-custody[gcp]"        # GcpKmsKeyStore (google-cloud-kms)
+pip install "ember-custody[server]"     # Optional ASGI mode (starlette + uvicorn)
 ```
 
 From a local clone (using [`uv`](https://docs.astral.sh/uv/)):
@@ -42,13 +61,15 @@ uv venv --python 3.13 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 ```
 
-See [Solving the Erasure / Receipt Trilemma](docs/TRILEMMA.md) for the cryptographic design and two-direction benchmark deep dive.
+See [Architecture](docs/ARCHITECTURE.md), [Threat Model](docs/THREAT_MODEL.md), and [Solving the Erasure / Receipt Trilemma](docs/TRILEMMA.md) for the cryptographic details.
 
 ---
 
 ## 60-Second Quickstart
 
-### 1. Wrap Mem0 (or any Vector Store) with Cascade Custody
+### 1. Drop-In Frameworks, Native Vector DBs & `TurnTrace`
+
+Wrap `Mem0` in one line (`EmberMem0`), drop into `LangChain` (`EmberLangChainRetriever`, `EmberLangChainVectorStore`) or `LlamaIndex` (`EmberLlamaIndexRetriever`), or construct `CustodyVault` directly over `QdrantAdapter`, `ChromaAdapter`, `PgVectorAdapter`, `PineconeAdapter`, `Mem0Adapter`, `SQLiteStoreAdapter`, or `InMemoryStoreAdapter`:
 
 ```python
 from mem0 import Memory
@@ -56,14 +77,16 @@ from ember import CustodyVault, Mem0Adapter, TombstonedSubjectError
 
 vault = CustodyVault.open(
     "./ember_ledger",
-    key_dir="./ember_keys",  # keep keys separate from ledger backups!
+    key_dir="./ember_keys",         # keep keys separate from ledger backups (or use AWS/GCP/Vault KMS)
     adapter=Mem0Adapter(Memory(), default_user_id="team_acme"),
+    encrypt_vendor_payload=True,    # zero plaintext PII inside the vendor vector DB
 )
 
-# Register a multi-party intake document (Merkle-indexed, zero raw text in ledger)
+# Register a compound multi-party intake sentence with clause-level sub-leaf redaction
 vault.register_source(
     "intake_notes",
-    "Priya Raman works in Portland on triage routing. Dana Kim leads pharmacy inventory.",
+    "Priya Raman works in Portland on triage routing, and Dana Kim leads pharmacy inventory.",
+    span_mode="clause",
     origin="onboarding_transcript",
     origin_kind="conversation",
 )
@@ -72,43 +95,44 @@ r_priya = vault.remember(
     "Priya Raman works in Portland on triage routing.",
     subjects=["priya"],
     source_id="intake_notes",
-    quote="Priya Raman works in Portland on triage routing.",
+    quote="Priya Raman works in Portland on triage routing,",
     metadata={"user_id": "priya"},
 )
 r_dana = vault.remember(
     "Dana Kim leads pharmacy inventory.",
     subjects=["dana"],
     source_id="intake_notes",
-    quote="Dana Kim leads pharmacy inventory.",
+    quote="and Dana Kim leads pharmacy inventory.",
     metadata={"user_id": "dana"},
 )
 
-# Derived team summary sits in a different user_id bucket — naive delete_all(user_id="priya") misses it
-vault.remember(
-    "Riverside handoff: triage routing pairs with pharmacy inventory.",
-    subjects=["team_acme"],
-    derived_from=[r_priya.item.item_id, r_dana.item.item_id],
-    metadata={"user_id": "team_acme"},
-)
+# TurnTrace automatically links search() reads -> remember() derived_from inside an agent turn
+with vault.trace_turn():
+    _ = vault.search("Priya triage")
+    vault.remember(
+        "Riverside handoff: triage routing pairs with pharmacy inventory.",
+        subjects=["team_acme"],
+        metadata={"user_id": "team_acme"},
+    )
 
-# Right to be Forgotten: cascades to Mem0 records, derived summaries, shared leaves, and keys
+# Right to be Forgotten: cascades to vendor records, derived turn notes, compound clauses, and keys
 cert = vault.erase(
     "priya",
     probes=["Where does Priya work?", "Who handles triage routing?"],
 )
 
-# Dana (innocent bystander) and her redacted source proof survive intact
+# Dana's clause in the SAME sentence + her redacted source proof survive intact
 assert vault.verify_item_receipt(r_dana.item.item_id) is True
 assert vault.search("Dana pharmacy").abstained is False
 
-# Re-ingesting Priya without explicit re-consent fails closed
+# Both explicit re-ingest AND untagged content mentioning Priya fail closed
 try:
-    vault.remember("Priya Raman works in Portland.", subjects=["priya"])
+    vault.remember("Priya Raman needs urgent follow-up.", subjects=["crm_sync_bot"])
 except TombstonedSubjectError:
     print("Blocked zombie re-ingestion")
 ```
 
-Run the self-contained examples without external API keys:
+Async agents can use `await AsyncCustodyVault.open(...)` or `async with vault.trace_turn():`. Run self-contained examples without external API keys:
 
 ```bash
 python examples/wrap_mem0.py
@@ -116,45 +140,80 @@ python examples/redactable_transcript.py
 python examples/offline_verify_bundle.py
 ```
 
-### 2. CLI Workflow & Offline Audit
+### 2. CLI, `ember.toml` & Air-Gapped HTML Dossier
 
 ```bash
-ember --vault .ember --key-dir .keys init
-ember --vault .ember --key-dir .keys add-source doc1 --text "Priya lives in Portland. Marcus lives in Leeds."
+ember --vault .ember --key-dir .keys --keystore-backend sqlite init
+ember --vault .ember --key-dir .keys add-source doc1 \
+  --text "Priya lives in Portland, and Marcus lives in Leeds." \
+  --span-mode clause
 ember --vault .ember --key-dir .keys remember "Priya lives in Portland." --subject priya --source-id doc1 --meta email=priya@example.org
 ember --vault .ember --key-dir .keys remember "Marcus lives in Leeds." --subject marcus --source-id doc1
 ember --vault .ember --key-dir .keys erase priya --probe "Where does Priya live?"
-ember --vault .ember --key-dir .keys replay
+ember --vault .ember --key-dir .keys checkpoint
+ember --vault .ember --key-dir .keys replay --use-checkpoint
 ember --vault .ember --key-dir .keys export --out bundle.json
-ember verify bundle.json --require-signature
+ember verify bundle.json --require-signature --html compliance-dossier.html
 ```
 
 Or copy `src/ember/verify.py` anywhere and run with Python standard library alone:
 
 ```bash
-python3 verify.py bundle.json
+python3 -S verify.py bundle.json
+```
+
+All CLI and sidecar subcommands also accept `--config ember.toml` (`[vault]`, `[ledger]`, `[keystore]`, `[adapter]`, `[anchor]`, `[server]`, with `${ENV_VAR:-default}` expansion).
+
+### 3. HTTP Custody Sidecar, TypeScript SDK & MCP Server
+
+Run Ember as a polyglot HTTP sidecar or stdio MCP server for non-Python agents and IDE tools:
+
+```bash
+# HTTP custody sidecar (stdlib ThreadingHTTPServer, or add --asgi for Starlette/uvicorn)
+export EMBER_API_TOKEN="your-secret-token"
+ember --vault .ember --key-dir .keys serve --host 127.0.0.1 --port 8420 --require-tenant-header
+
+# Model Context Protocol (MCP) JSON-RPC 2.0 stdio server
+ember-mcp --vault .ember --key-dir .keys
+```
+
+TypeScript / Node.js / Bun / Deno clients use the zero-dependency SDK in [`sdk/ts/`](sdk/ts/src/index.ts):
+
+```ts
+import { EmberClient } from "@ember-custody/client";
+
+const ember = new EmberClient({
+  baseUrl: "http://127.0.0.1:8420",
+  bearerToken: process.env.EMBER_API_TOKEN,
+  tenantId: "default",
+});
+
+await ember.registerSource({
+  source_id: "doc1",
+  text: "Maya takes warfarin daily, and Leo plays violin.",
+  span_mode: "clause",
+});
+await ember.remember({ text: "Maya takes warfarin daily", subjects: ["maya"], source_id: "doc1" });
+const cert = await ember.erase({ subject_id: "maya", probes: ["warfarin"] });
 ```
 
 ---
 
 ## Adversarial Benchmark & Two-Direction Calibration
 
-Run the deterministic keyword-overlap fixture (`InMemoryStoreAdapter`) across 12 subjects × 7 attack classes (`direct`, `paraphrase`, `inference`, `multi_hop`, `attribute`, `temporal`, `aggregate` — 204 attack probes total):
+Run both the V2 suite and the expanded V3 Phase-2 suite across 12 subjects × 7 attack classes (`direct`, `paraphrase`, `inference`, `multi_hop`, `attribute`, `temporal`, `aggregate` — 204 attack probes total):
 
 ```bash
-ember benchmark
+ember benchmark --suite v3
 ```
 
-Measured output comparing a naive `delete_all(user_id=subject)` baseline (where derived team summaries live under a workspace bucket) against Ember:
+Measured output against `InMemoryStoreAdapter`:
 
 ```text
-EMBER ERASURE ADVERSARIAL SUITE — 12 subjects, 204 probes (7 attack classes)
+EMBER ERASURE ADVERSARIAL SUITE V3 — 12 subjects, 204 probes (7 attack classes)
   Adapter   : InMemoryStoreAdapter (retrieval=keyword_overlap, store=in-process)
   Embedding : none
   Search    : bystander_limit=5, erase_probe_limit=25, naive_delete=user_id_metadata_exact, probe_limit=10
-==============================================================================
-  Priya      baseline_leaks=17  ember_leaks= 0  derived=1  bystander_ok=True  receipt_ok=True  replay_clean=True
-  ... (12 subjects total)
 ==============================================================================
   Adapter              : InMemoryStoreAdapter (keyword_overlap, embed=none)
   Baseline naive leaks : 204/204
@@ -163,11 +222,15 @@ EMBER ERASURE ADVERSARIAL SUITE — 12 subjects, 204 probes (7 attack classes)
   Receipts intact      : True
   Replays content-free : True
   Ed25519 certs valid  : True
+  Sub-leaf redactions  : True
+  TurnTrace derived ok : True
+  Vendor zero-plaintext: True
+  Zombie content block : True
 ```
 
 ### Real Vector-Store Comparison (`Mem0` + Qdrant + Dense Embeddings)
 
-`run_benchmark()` accepts any `BenchmarkBackendSpec` (`mem0_backend_spec`) so the exact same 204-probe corpus, bystander survival checks, redacted Merkle receipt checks, content-free replay verification, and Ed25519 certificate verification can run against a live vector store:
+`run_benchmark()` and `run_v3_benchmark()` accept any `BenchmarkBackendSpec` (`mem0_backend_spec`) so the exact same 204-probe corpus, bystander survival checks, redacted Merkle receipt checks, content-free replay verification, and Ed25519 certificate verification can run against a live vector store:
 
 ```bash
 pip install "ember-custody[mem0]" qdrant-client sentence-transformers
@@ -199,9 +262,9 @@ Why bystander checks are co-primary: leak rate alone is monotone in deletion —
 
 Ember documents what cryptography cannot invent locally (see [`SECURITY.md`](SECURITY.md) and [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)):
 
-1. **Key Separation & Backups:** Crypto-shredding protects live logs and snapshots taken *after* erasure only if pre-erasure backups did not copy unshredded keys alongside `ledger.db`. Configure a separate `key_dir` or implement `ember.keystore.KeyStore` over KMS/HSM (`AWS KMS`, `GCP KMS`, `Vault Transit`).
-2. **External Time Anchoring:** Self-signed local `Ed25519` proofs establish internal ordering and integrity; preventing an operator holding both `ledger.db` and `ed25519.json` from backdating the whole chain requires plugging an RFC 3161 TSA or public transparency log via `ember.signing.TimestampAnchor`.
-3. **Wrapped Store Internal History Tables (e.g., Mem0 `history.db`):** `Mem0Adapter` deletes live Mem0 vector points (and Mem0 strips entity links), while Ember's own ledger stays AES-256-GCM encrypted and crypto-shredded. However, `mem0.Memory` also maintains an internal plaintext SQLite history DB (`history_db_path`, logging `old_memory` even on `"DELETE"` events). Treat `history_db_path` as non-shredded vendor state: isolate or purge/rotate it alongside erasure if deployed on disk.
+1. **Key Separation & Backups:** Crypto-shredding protects live logs and snapshots taken *after* erasure only if pre-erasure backups did not copy unshredded keys alongside ledger storage. Configure a separate `key_dir` or use `AwsKmsKeyStore`, `GcpKmsKeyStore`, or `VaultTransitKeyStore` + `PostgresLedger`.
+2. **External Time Anchoring:** Self-signed local `Ed25519` proofs establish internal ordering and integrity; preventing an operator holding both ledger and signing key from backdating history requires `Rfc3161Anchor` or `RekorAnchor`.
+3. **Wrapped Store Internal History Tables (e.g., Mem0 `history.db`):** `Mem0Adapter` deletes live Mem0 vector points (and Mem0 strips entity links), while Ember's own ledger stays AES-256-GCM encrypted and crypto-shredded. However, OSS `mem0.Memory` also maintains an internal plaintext SQLite history DB (`history_db_path`, logging `old_memory` even on `"DELETE"` events). Configure `encrypt_vendor_payload=True` + an `embedder` (bypassing `.add()`) or isolate/prune `history_db_path`.
 
 ---
 

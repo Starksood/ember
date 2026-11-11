@@ -745,6 +745,8 @@ class CustodyVault:
         content_guard: bool = True,
     ) -> RememberResult:
         """Encrypt, bind provenance receipt, commit to ledger, and upsert into the backing store."""
+        if isinstance(subjects, (str, bytes)):
+            raise ValueError("subjects must be a sequence/iterable of strings, not a single string")
         subj_tuple = tuple(dict.fromkeys(str(s) for s in subjects if str(s).strip()))
         if not subj_tuple:
             raise ValueError("remember() requires at least one non-empty subject ID")

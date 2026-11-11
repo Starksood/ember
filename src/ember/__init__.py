@@ -1,5 +1,7 @@
 """Ember: cryptographic custody, redactable Merkle receipts, and verifiable cascade erasure."""
 
+__version__ = "0.2.0"
+
 from .adapters import (
     AdapterHit,
     AdapterOp,
@@ -15,12 +17,15 @@ from .adapters import (
 )
 from .audit import (
     SUITE_V2,
+    SUITE_V3,
     BenchmarkBackendSpec,
     ScenarioBackendPair,
     SubjectScenario,
     in_memory_backend_spec,
     mem0_backend_spec,
     run_benchmark,
+    run_v3_benchmark,
+    run_v3_subject_scenario,
     verify_suite_hygiene,
 )
 from .config import (
@@ -49,6 +54,7 @@ from .kms import (
     VaultTransitKeyStore,
 )
 from .ledger import IdempotencyConflict, LedgerBackend, LedgerIntegrityError, PostgresLedger, SQLiteLedger
+from .mcp_server import EmberMcpServer
 from .merkle import (
     RedactableDoc,
     SpanChunkerFn,
@@ -72,6 +78,8 @@ from .reducer import (
     decrypt_item_metadata,
     decrypt_item_payload,
 )
+from .report import generate_html_report
+from .server import EmberHttpApp, create_asgi_app, make_http_server, start_background_server
 from .signing import (
     AnchorReceipt,
     CallbackAnchor,
@@ -83,8 +91,6 @@ from .signing import (
 )
 from .vault import AsyncCustodyVault, CustodyVault, QueryHit, RememberResult, SearchResult, TurnTrace
 from .verify import verify_bundle, verify_ed25519_certificate, verify_ledger_chain, verify_redactable_receipt
-
-__version__ = "0.2.0"
 
 __all__ = [
     "AdapterHit",
@@ -103,9 +109,11 @@ __all__ = [
     "Ed25519Signer",
     "EmberConfig",
     "EmberDocument",
+    "EmberHttpApp",
     "EmberLangChainRetriever",
     "EmberLangChainVectorStore",
     "EmberLlamaIndexRetriever",
+    "EmberMcpServer",
     "EmberMem0",
     "EmberNodeWithScore",
     "EmberState",
@@ -143,6 +151,7 @@ __all__ = [
     "SQLiteLedger",
     "SQLiteStoreAdapter",
     "SUITE_V2",
+    "SUITE_V3",
     "ScenarioBackendPair",
     "SearchResult",
     "ShredReport",
@@ -158,14 +167,17 @@ __all__ = [
     "__version__",
     "apply_event",
     "compute_closure",
+    "create_asgi_app",
     "decrypt_item_metadata",
     "decrypt_item_payload",
     "find_ember_config",
+    "generate_html_report",
     "in_memory_backend_spec",
     "inclusion_proof",
     "leaf_hash",
     "load_ember_config",
     "locate_span",
+    "make_http_server",
     "mem0_backend_spec",
     "merkle_root",
     "mint_flat_receipt",
@@ -173,8 +185,11 @@ __all__ = [
     "open_vault_from_config",
     "parse_ember_config_dict",
     "run_benchmark",
+    "run_v3_benchmark",
+    "run_v3_subject_scenario",
     "split_parts",
     "split_spans_with_offsets",
+    "start_background_server",
     "verify_bundle",
     "verify_ed25519_certificate",
     "verify_ledger_chain",

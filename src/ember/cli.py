@@ -5,18 +5,20 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
 
 from . import __version__
 from .adapters import InMemoryStoreAdapter, MemoryStoreAdapter, SQLiteStoreAdapter
-from .audit import run_benchmark
+from .audit import run_benchmark, run_v3_benchmark
 from .config import EmberConfig, load_ember_config, open_vault_from_config
 from .crypto import DecryptionError, ERASED_TOMBSTONE
 from .kms import KmsOperationError
 from .ledger import IdempotencyConflict, LedgerIntegrityError
 from .reducer import ErasureIncomplete, InvariantViolation, TombstonedSubjectError
+from .report import generate_html_report
 from .signing import NullAnchor, RekorAnchor, Rfc3161Anchor, TimestampAnchor
 from .vault import CustodyVault
 from .verify import verify_bundle
@@ -309,6 +311,17 @@ def _cmd_export(args: argparse.Namespace) -> int:
 def _cmd_verify(args: argparse.Namespace) -> int:
     data = json.loads(Path(args.bundle).read_text(encoding="utf-8"))
     report = verify_bundle(data, require_signature_check=args.require_signature)
+    html_out = getattr(args, "html", None)
+    if html_out:
+        out_path = Path(html_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        html_doc = generate_html_report(
+            data,
+            report=report,
+            require_signature_check=args.require_signature,
+        )
+        out_path.write_text(html_doc, encoding="utf-8")
+        report["html_report"] = str(out_path)
     print(json.dumps(report, indent=2))
     return 0 if report["ok"] else 1
 
@@ -323,8 +336,13 @@ def format_benchmark_report(report: dict[str, Any]) -> str:
     search_settings = adapter.get("search_settings") or {}
     settings_str = ", ".join(f"{k}={v}" for k, v in sorted(search_settings.items())) or "default"
 
+    suite_title = (
+        "EMBER ERASURE ADVERSARIAL SUITE V3"
+        if report.get("suite") == "ember_erasure_v3"
+        else "EMBER ERASURE ADVERSARIAL SUITE"
+    )
     lines = [
-        f"\nEMBER ERASURE ADVERSARIAL SUITE — {report['subjects']} subjects, "
+        f"\n{suite_title} — {report['subjects']} subjects, "
         f"{report['total_probes']} probes (7 attack classes)",
         f"  Adapter   : {adapter_name} (retrieval={retrieval_mode}, store={vector_store})",
         f"  Embedding : {embedding_model}",
@@ -350,16 +368,96 @@ def format_benchmark_report(report: dict[str, Any]) -> str:
             f"  Ed25519 certs valid  : {report['all_certificates_valid']}",
         ]
     )
+    if "all_subleaf_redactions_ok" in report:
+        lines.extend(
+            [
+                f"  Sub-leaf redactions  : {report['all_subleaf_redactions_ok']}",
+                f"  TurnTrace derived ok : {report['all_turn_trace_auto_derived_ok']}",
+                f"  Vendor zero-plaintext: {report['all_encrypted_vendor_zero_plaintext']}",
+                f"  Zombie content block : {report['all_zombie_content_blocked']}",
+            ]
+        )
     return "\n".join(lines)
 
 
 def _cmd_benchmark(args: argparse.Namespace) -> int:
-    report = run_benchmark()
+    suite_name = getattr(args, "suite", "v2")
+    report = run_v3_benchmark() if suite_name == "v3" else run_benchmark()
     if args.json:
         print(json.dumps(report, indent=2))
     else:
         print(format_benchmark_report(report))
     return 0 if report["passed"] else 1
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from .server import create_asgi_app, make_http_server
+
+    cfg_srv: dict[str, Any] = {}
+    if getattr(args, "config", None):
+        cfg_srv = dict(load_ember_config(args.config).server or {})
+
+    host = str(args.host or cfg_srv.get("host") or "127.0.0.1")
+    port = int(args.port if args.port is not None else cfg_srv.get("port", 8420))
+    bearer = args.bearer_token or cfg_srv.get("bearer_token") or os.environ.get("EMBER_API_TOKEN") or None
+    require_tenant = bool(args.require_tenant_header or cfg_srv.get("require_tenant_header", False))
+
+    vault, store = _vault(args)
+    try:
+        if args.asgi:
+            try:
+                import uvicorn
+            except ImportError as exc:
+                raise ImportError(
+                    "--asgi requires 'uvicorn' and 'starlette' (`pip install 'ember-custody[server]'`)"
+                ) from exc
+            app = create_asgi_app(
+                vault,
+                bearer_token=bearer,
+                require_tenant_header=require_tenant,
+            )
+            uvicorn.run(app, host=host, port=port)
+            return 0
+
+        httpd = make_http_server(
+            vault,
+            host=host,
+            port=port,
+            bearer_token=bearer,
+            require_tenant_header=require_tenant,
+            allow_insecure_no_auth=args.allow_insecure_no_auth,
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "listening",
+                    "host": host,
+                    "port": httpd.server_address[1],
+                    "tenant_id": vault.tenant_id,
+                    "auth_enabled": bool(bearer),
+                }
+            ),
+            flush=True,
+        )
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            httpd.server_close()
+        return 0
+    finally:
+        _close_vault_pair(vault, store)
+
+
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    from .mcp_server import EmberMcpServer
+
+    vault, store = _vault(args)
+    try:
+        return EmberMcpServer(vault).run_stdio()
+    finally:
+        _close_vault_pair(vault, store)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -435,11 +533,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_ver = sub.add_parser("verify", help="Verify an exported verification bundle offline")
     p_ver.add_argument("bundle")
     p_ver.add_argument("--require-signature", action="store_true")
+    p_ver.add_argument("--html", default=None, help="Write standalone HTML compliance dossier to path")
     p_ver.set_defaults(func=_cmd_verify)
 
-    p_bench = sub.add_parser("benchmark", help="Run the 12-subject x 7-class adversarial erasure suite")
+    p_bench = sub.add_parser("benchmark", help="Run the 12-subject adversarial erasure suite")
+    p_bench.add_argument("--suite", choices=("v2", "v3"), default="v2")
     p_bench.add_argument("--json", action="store_true")
     p_bench.set_defaults(func=_cmd_benchmark)
+
+    p_srv = sub.add_parser("serve", help="Run HTTP custody sidecar server")
+    p_srv.add_argument("--host", default=None)
+    p_srv.add_argument("--port", type=int, default=None)
+    p_srv.add_argument("--bearer-token", default=None)
+    p_srv.add_argument("--require-tenant-header", action="store_true")
+    p_srv.add_argument("--allow-insecure-no-auth", action="store_true")
+    p_srv.add_argument("--asgi", action="store_true")
+    p_srv.set_defaults(func=_cmd_serve)
+
+    p_mcp = sub.add_parser("mcp", help="Run Model Context Protocol (MCP) JSON-RPC stdio server")
+    p_mcp.set_defaults(func=_cmd_mcp)
 
     return parser
 

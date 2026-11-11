@@ -20,6 +20,9 @@ Ember prefers explicit boundaries over security theater.
 | Plaintext text/PII stored on third-party vector DB host | **Mitigated** | `encrypt_vendor_payload=True` sends AES-256-GCM ciphertext (`text_ct`) and opaque HMAC `subject_ref` scopes with external embeddings or HMAC blind-index tokens |
 | Fake / over-deleting erasure scoring 0 leaks by wiping bystander | **Rejected** | `CustodyVault.erase` and `audit.py` require surviving bystander retrieval & bystander receipt verification |
 | Erasure claimed complete despite vendor store still answering | **Blocked** | `erase()` synthesizes auto-probes from doomed items + explicit `probes`, queries underlying adapter raw search, and raises `ErasureIncomplete` without issuing a certificate |
+| Operator/root rewriting local SQLite + Ed25519 timestamps coherently | **Mitigated** | `Rfc3161Anchor` (DER TSA token) & `RekorAnchor` (Sigstore transparency log) bind certificate SHA-256 digests externally |
+| Cross-tenant or unauthenticated HTTP sidecar (`ember serve`) calls | **Blocked** | Constant-time Bearer auth (`hmac.compare_digest`), non-loopback no-auth bind refusal, optional `X-Ember-Tenant` lock, body cap (`413`) |
+| Malicious bundle payload injecting HTML/JS into audit reports | **Blocked** | `generate_html_report` runs strict `html.escape(..., quote=True)` across every tenant, quote, doc, and JSON field with zero external CDNs |
 
 ## Explicit Out-of-Scope Boundaries
 
