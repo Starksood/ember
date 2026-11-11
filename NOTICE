@@ -1,0 +1,5 @@
+Ember (ember-custody)
+Copyright 2026 Sanyam Sood
+
+Cryptographic custody, redactable Merkle provenance receipts, and
+adversarially tested cascade erasure primitives distilled from Fireweed.

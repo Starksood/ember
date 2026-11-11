@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ember-custody"
+version = "0.1.0"
+description = "Cryptographic custody, redactable Merkle receipts, and verifiable cascade erasure for AI memory and RAG stores."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [
+  { name = "Sanyam Sood", email = "sasood01@wsc.edu" },
+]
+keywords = [
+  "ai-memory",
+  "gdpr",
+  "right-to-be-forgotten",
+  "crypto-shredding",
+  "merkle-tree",
+  "provenance",
+  "mem0",
+  "rag",
+  "audit-log",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security :: Cryptography",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+mem0 = ["mem0ai>=0.1.0"]
+dev = ["pytest>=8.0", "ruff>=0.6.0"]
+
+[project.scripts]
+ember = "ember.cli:main"
+ember-verify = "ember.verify:main"
+
+[project.urls]
+Homepage = "https://github.com/Starksood/ember"
+Repository = "https://github.com/Starksood/ember"
+Issues = "https://github.com/Starksood/ember/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
