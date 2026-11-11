@@ -17,6 +17,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
       - name: Install package and test dependencies
         run: |
           python -m pip install --upgrade pip
@@ -25,5 +28,7 @@ jobs:
         run: ruff check src tests examples
       - name: Run unit, integration, adversarial, and calibration tests
         run: pytest -v
-      - name: Run 12-subject x 7-class erasure benchmark
-        run: ember benchmark
+      - name: Run 12-subject x 7-class erasure benchmarks (V2 & V3)
+        run: |
+          ember benchmark
+          ember benchmark --suite v3

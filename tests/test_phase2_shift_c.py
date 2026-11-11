@@ -199,21 +199,36 @@ def test_c1_http_sidecar_live_tcp_and_typescript_sdk(tmp_path: Path) -> None:
 
         node_bin = shutil.which("node")
         if node_bin is not None:
-            sdk_dir = Path(__file__).resolve().parent.parent / "sdk" / "ts"
-            env = dict(os.environ)
-            env["EMBER_LIVE_TEST_URL"] = f"http://127.0.0.1:{port}"
-            env["EMBER_LIVE_TEST_TOKEN"] = live_secret  # noqa: S105
-            env["EMBER_LIVE_TEST_TENANT"] = "ts_demo"
-            proc = subprocess.run(
-                [node_bin, "--test", "test/client.test.mts"],
-                cwd=str(sdk_dir),
-                env=env,
+            ver_proc = subprocess.run(
+                [node_bin, "-p", "process.versions.node"],
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=20,
+                timeout=5,
             )
-            assert proc.returncode == 0, f"TS SDK test failed:\n{proc.stdout}\n{proc.stderr}"
+            parts = tuple(int(p) for p in ver_proc.stdout.strip().split(".")[:2] if p.isdigit())
+            node_flags: list[str] | None = None
+            if len(parts) == 2 and (parts[0] > 23 or (parts[0] == 23 and parts[1] >= 6)):
+                node_flags = ["--test"]
+            elif len(parts) == 2 and ((parts[0] == 22 and parts[1] >= 6) or (parts[0] == 23 and parts[1] < 6)):
+                node_flags = ["--experimental-strip-types", "--test"]
+
+            if node_flags is not None:
+                sdk_dir = Path(__file__).resolve().parent.parent / "sdk" / "ts"
+                env = dict(os.environ)
+                env["EMBER_LIVE_TEST_URL"] = f"http://127.0.0.1:{port}"
+                env["EMBER_LIVE_TEST_TOKEN"] = live_secret  # noqa: S105
+                env["EMBER_LIVE_TEST_TENANT"] = "ts_demo"
+                proc = subprocess.run(
+                    [node_bin, *node_flags, "test/client.test.mts"],
+                    cwd=str(sdk_dir),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=20,
+                )
+                assert proc.returncode == 0, f"TS SDK test failed:\n{proc.stdout}\n{proc.stderr}"
     finally:
         httpd.shutdown()
         httpd.server_close()
