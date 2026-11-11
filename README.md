@@ -23,14 +23,6 @@ Existing memory engines (`Mem0`, `Letta`, `LangChain`, vector databases) know ho
 
 ## Installation
 
-Install directly from GitHub (`0.1.0` PyPI Trusted Publishing pending release):
-
-```bash
-pip install "ember-custody @ git+https://github.com/Starksood/ember.git"
-```
-
-Once published to PyPI:
-
 ```bash
 pip install ember-custody
 ```
@@ -38,7 +30,7 @@ pip install ember-custody
 Optional Mem0 extra:
 
 ```bash
-pip install "ember-custody[mem0] @ git+https://github.com/Starksood/ember.git"
+pip install "ember-custody[mem0]"
 ```
 
 From a local clone (using [`uv`](https://docs.astral.sh/uv/)):
