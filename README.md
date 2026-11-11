@@ -23,17 +23,25 @@ Existing memory engines (`Mem0`, `Letta`, `LangChain`, vector databases) know ho
 
 ## Installation
 
+Install directly from GitHub (`0.1.0` PyPI Trusted Publishing pending release):
+
+```bash
+pip install "ember-custody @ git+https://github.com/Starksood/ember.git"
+```
+
+Once published to PyPI:
+
 ```bash
 pip install ember-custody
 ```
 
-Optional integration extras:
+Optional Mem0 extra:
 
 ```bash
-pip install "ember-custody[mem0]"
+pip install "ember-custody[mem0] @ git+https://github.com/Starksood/ember.git"
 ```
 
-From source (using [`uv`](https://docs.astral.sh/uv/)):
+From a local clone (using [`uv`](https://docs.astral.sh/uv/)):
 
 ```bash
 git clone https://github.com/Starksood/ember.git
@@ -41,6 +49,8 @@ cd ember
 uv venv --python 3.13 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 ```
+
+See [Solving the Erasure / Receipt Trilemma](docs/TRILEMMA.md) for the cryptographic design and two-direction benchmark deep dive.
 
 ---
 
