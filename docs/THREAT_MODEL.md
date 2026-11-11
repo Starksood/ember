@@ -12,6 +12,8 @@ Ember prefers explicit boundaries over security theater.
 | Redacting Subject A breaking Bystander B's provenance proof | **Solved** | Per-leaf Merkle inclusion proofs keep root invariant across bystander-disjoint redactions |
 | Downstream derived summary / reflection leaking erased subject | **Blocked** | Exact transitive `derived_from` closure + shared `record` DEK shredding + external ID deletion |
 | Cross-record or cross-tenant ciphertext splicing | **Blocked** | AES-256-GCM AAD binds `(tenant_id, record_id, field, key_ref)` |
+| Caller `metadata` PII (`user_id`, emails) lingering in ledger logs | **Blocked** | Encrypted into `metadata_ciphertext` via AES-256-GCM; redacted to `{}` on key shred |
+| Transient vendor API failure leaving keys unshredded mid-erasure | **Blocked** | Local source redaction + key shredding run before external `adapter.delete()`; retry sweeps prior pending closure IDs |
 | Dictionary test on `ERASE_SUBJECT` tombstone names in ledger | **Blocked** | Vault-keyed `HMAC-SHA256(tombstone_secret, normalized_identifier)` |
 | Silent re-ingestion of erased subject on retry/sync | **Blocked** | Tombstone tokens block `remember()` with `TombstonedSubjectError` unless `reconsent_id` is supplied |
 | Fake / over-deleting erasure scoring 0 leaks by wiping bystander | **Rejected** | `CustodyVault.erase` and `audit.py` require surviving bystander retrieval & bystander receipt verification |

@@ -13,7 +13,7 @@ import json
 from types import MappingProxyType
 from typing import Any
 
-from .crypto import build_aad, decrypt_text
+from .crypto import ERASED_TOMBSTONE, build_aad, decrypt_text
 from .keystore import KeyStore
 from .records import ClosureManifest, LedgerEvent, MemoryItem, SourceRecord
 from .verify import canonical_bytes, sha256_prefixed
@@ -74,6 +74,7 @@ class EmberState:
                     "subjects": list(v.subjects),
                     "text": v.text,
                     "quote": v.quote,
+                    "metadata": dict(v.metadata),
                 }
                 for k, v in sorted(self.items.items())
             },
@@ -181,12 +182,39 @@ def decrypt_item_payload(
     return plain_subjects, plain_text, plain_quote
 
 
+def decrypt_item_metadata(
+    payload: dict[str, Any],
+    keystore: KeyStore | None,
+) -> dict[str, Any]:
+    """Decrypt encrypted caller metadata via KeyStore; yield `{}` if shredded or un-decryptable."""
+    meta_ct = payload.get("metadata_ciphertext")
+    if not isinstance(meta_ct, str) or not meta_ct:
+        legacy = payload.get("metadata")
+        return dict(legacy) if isinstance(legacy, dict) else {}
+    key_kind = str(payload["key_kind"])
+    key_id = str(payload["key_id"])
+    key_ref = f"{key_kind}:{key_id}"
+    tenant_id = str(payload["tenant_id"])
+    item_id = str(payload["item_id"])
+    key = keystore.key_for(key_kind, key_id) if keystore is not None else None
+    meta_aad = build_aad(tenant_id=tenant_id, record_id=item_id, field="metadata", key_ref=key_ref)
+    plain_meta_json = decrypt_text(key, meta_ct, aad=meta_aad, strict=False)
+    if plain_meta_json == ERASED_TOMBSTONE:
+        return {}
+    try:
+        loaded = json.loads(plain_meta_json)
+        return dict(loaded) if isinstance(loaded, dict) else {}
+    except ValueError:
+        return {}
+
+
 def apply_event(
     state: EmberState,
     event: LedgerEvent,
     *,
     keystore: KeyStore | None = None,
     decrypted_override: tuple[tuple[str, ...], str | None, str | None] | None = None,
+    metadata_override: dict[str, Any] | None = None,
 ) -> EmberState:
     """Validate and apply one committed/replayed `LedgerEvent` to produce the next `EmberState`."""
     if event.kind not in EVENT_KINDS:
@@ -214,7 +242,7 @@ def apply_event(
         overlap = item_tokens & state.tombstoned_tokens
         if overlap and not item_data.get("reconsent_id"):
             raise TombstonedSubjectError(
-                f"refusing ingest for tombstoned subject token(s) without explicit reconsent_id"
+                "refusing ingest for tombstoned subject token(s) without explicit reconsent_id"
             )
         receipt_meta = item_data.get("receipt_meta")
         if isinstance(receipt_meta, dict) and receipt_meta.get("source_id"):
@@ -229,11 +257,16 @@ def apply_event(
             plain_subjects, plain_text, plain_quote = decrypted_override
         else:
             plain_subjects, plain_text, plain_quote = decrypt_item_payload(item_data, keystore)
+        if metadata_override is not None:
+            plain_meta = dict(metadata_override)
+        else:
+            plain_meta = decrypt_item_metadata(item_data, keystore)
         item = MemoryItem.from_ledger_payload(
             item_data,
             subjects=plain_subjects,
             text=plain_text,
             quote=plain_quote,
+            metadata=plain_meta,
         )
         items = dict(state.items)
         items[item.item_id] = item

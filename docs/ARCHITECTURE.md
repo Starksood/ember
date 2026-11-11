@@ -35,7 +35,7 @@ Ember separates **immutable cryptographic accountability** from **mutable erasur
 
 1. **Append-Only Ledger Holds Zero Plaintext:**
    - `ADD_SOURCE` stores `merkle_root`, `flat_doc_hash`, `byte_length`, and `leaf_count`, alongside caller-declared `origin` metadata. Raw document text is **never** written to `ledger_events`.
-   - `ADD_ITEM` encrypts `subjects`, `text`, and quoted `evidence` spans via AES-256-GCM bound to `(tenant_id, item_id, field, key_ref)` AAD.
+   - `ADD_ITEM` encrypts `subjects`, `text`, quoted `evidence` spans, and caller `metadata` via AES-256-GCM bound to `(tenant_id, item_id, field, key_ref)` AAD.
    - `ERASE_SUBJECT` records only keyed HMAC tombstone tokens and structural `ClosureManifest` IDs.
 
 2. **Two-Tier Encryption Keys (`subject` CEK + `record` DEK):**

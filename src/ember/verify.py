@@ -7,7 +7,8 @@ Anyone with Python 3.11+ (and no third-party packages) can copy this single file
   * append-only SHA-256 hash-chained ledger integrity
 
 Ed25519 signature verification on ErasureCertificates uses `cryptography` if installed, and
-explicitly reports `signature_checked=False` rather than silently claiming pass when absent.
+explicitly reports `signature_checked=False` / `verified=None` rather than silently claiming pass
+when absent.
 """
 
 from __future__ import annotations
@@ -26,9 +27,18 @@ EMPTY_TREE_ROOT = hashlib.sha256(LEAF_PREFIX).hexdigest()
 GENESIS_HASH = "sha256:" + ("0" * 64)
 
 
+def _is_strict_int(value: Any) -> bool:
+    """Return True only for real ints (never `bool`, since bool subclasses int in Python)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_non_string_sequence(value: Any) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+
+
 def canonical_bytes(value: Any) -> bytes:
     """Deterministic UTF-8 ASCII-escaped canonical JSON representation."""
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
 
 
 def sha256_prefixed(data: bytes) -> str:
@@ -53,6 +63,8 @@ def leaf_hash(part: str, nonce: str = "") -> str:
 
 def interior_hash(left_hex: str, right_hex: str) -> str:
     """Compute RFC 6962 interior node digest: H(0x01 || left_32 || right_32)."""
+    if not isinstance(left_hex, str) or not isinstance(right_hex, str):
+        raise ValueError("interior digests must be hex strings")
     left = bytes.fromhex(left_hex)
     right = bytes.fromhex(right_hex)
     if len(left) != 32 or len(right) != 32:
@@ -88,6 +100,10 @@ def verify_inclusion(
     When `leaf_index` and `total_leaves` are both provided, also verifies that each
     proof sibling side strictly matches the tree walk for that leaf position.
     """
+    if not isinstance(leaf_digest, str) or not isinstance(expected_root, str):
+        return False
+    if not _is_non_string_sequence(proof):
+        return False
     try:
         raw_leaf = bytes.fromhex(leaf_digest)
         raw_root = bytes.fromhex(expected_root)
@@ -97,6 +113,8 @@ def verify_inclusion(
         return False
 
     if leaf_index is not None and total_leaves is not None:
+        if not _is_strict_int(leaf_index) or not _is_strict_int(total_leaves):
+            return False
         if total_leaves <= 0 or not (0 <= leaf_index < total_leaves):
             return False
         idx = leaf_index
@@ -111,11 +129,11 @@ def verify_inclusion(
                 if proof_pos >= len(proof):
                     return False
                 step = proof[proof_pos]
-                if len(step) != 2:
+                if not _is_non_string_sequence(step) or len(step) != 2:
                     return False
                 side, sibling = step[0], step[1]
                 expected_side = "right" if idx % 2 == 0 else "left"
-                if side != expected_side:
+                if side != expected_side or not isinstance(sibling, str):
                     return False
                 try:
                     cur = interior_hash(cur, sibling) if side == "right" else interior_hash(sibling, cur)
@@ -130,10 +148,10 @@ def verify_inclusion(
 
     cur = leaf_digest
     for step in proof:
-        if len(step) != 2:
+        if not _is_non_string_sequence(step) or len(step) != 2:
             return False
         side, sibling = step[0], step[1]
-        if side not in ("left", "right"):
+        if side not in ("left", "right") or not isinstance(sibling, str):
             return False
         try:
             cur = interior_hash(cur, sibling) if side == "right" else interior_hash(sibling, cur)
@@ -144,26 +162,31 @@ def verify_inclusion(
 
 def verify_flat_receipt(receipt: Mapping[str, Any], raw_doc: bytes) -> bool:
     """Verify flat SHA-256 byte-range receipt against full unredacted document bytes."""
+    if not isinstance(receipt, Mapping) or not isinstance(raw_doc, (bytes, bytearray)):
+        return False
+    raw_bytes = bytes(raw_doc)
     flat_hash = receipt.get("flat_doc_hash") or receipt.get("doc_hash")
     quote = receipt.get("quote")
     start = receipt.get("byte_start")
     end = receipt.get("byte_end")
-    if not isinstance(flat_hash, str) or not isinstance(quote, str):
+    if not isinstance(flat_hash, str) or not isinstance(quote, str) or not quote:
         return False
-    if not isinstance(start, int) or not isinstance(end, int):
+    if not _is_strict_int(start) or not _is_strict_int(end):
         return False
-    if sha256_prefixed(raw_doc) != flat_hash:
+    if sha256_prefixed(raw_bytes) != flat_hash:
         return False
-    if not (0 <= start <= end <= len(raw_doc)):
+    if not (0 <= start <= end <= len(raw_bytes)):
         return False
     try:
-        return raw_doc[start:end].decode("utf-8") == quote
+        return raw_bytes[start:end].decode("utf-8") == quote
     except UnicodeDecodeError:
         return False
 
 
 def redactable_doc_hashes(doc_dict: Mapping[str, Any]) -> list[str] | None:
     """Recompute ordered leaf hashes for a serialized RedactableDoc dict cleanly."""
+    if not isinstance(doc_dict, Mapping):
+        return None
     entries = doc_dict.get("entries")
     if not isinstance(entries, list):
         return None
@@ -171,9 +194,19 @@ def redactable_doc_hashes(doc_dict: Mapping[str, Any]) -> list[str] | None:
     for expected_idx, entry in enumerate(entries):
         if not isinstance(entry, Mapping):
             return None
-        if entry.get("index", expected_idx) != expected_idx:
+        if "index" in entry:
+            idx = entry["index"]
+            if not _is_strict_int(idx) or idx != expected_idx:
+                return None
+        if "byte_start" in entry or "byte_end" in entry:
+            b_start = entry.get("byte_start")
+            b_end = entry.get("byte_end")
+            if not _is_strict_int(b_start) or not _is_strict_int(b_end) or not (0 <= b_start <= b_end):
+                return None
+        redacted_flag = entry.get("redacted", False)
+        if not isinstance(redacted_flag, bool):
             return None
-        if entry.get("redacted"):
+        if redacted_flag:
             if "text" in entry or "nonce" in entry:
                 # Fail closed: a redacted entry must have stripped plaintext and nonce.
                 return None
@@ -197,13 +230,16 @@ def redactable_doc_hashes(doc_dict: Mapping[str, Any]) -> list[str] | None:
 
 def verify_redactable_doc(doc_dict: Mapping[str, Any], expected_root: str | None = None) -> tuple[bool, str]:
     """Validate structure, redaction hygiene, and Merkle root of a RedactableDoc dict."""
+    if not isinstance(doc_dict, Mapping):
+        return False, "document must be a JSON object"
     hashes = redactable_doc_hashes(doc_dict)
     if hashes is None:
         return False, "invalid entries or incomplete redaction"
     computed_root = merkle_root(hashes)
-    stored_root = doc_dict.get("merkle_root")
-    if isinstance(stored_root, str) and stored_root != computed_root:
-        return False, "stored merkle_root mismatches recomputed root"
+    if "merkle_root" in doc_dict:
+        stored_root = doc_dict["merkle_root"]
+        if not isinstance(stored_root, str) or stored_root != computed_root:
+            return False, "stored merkle_root mismatches recomputed root"
     if expected_root is not None and computed_root != expected_root:
         return False, "recomputed root mismatches expected merkle_root"
     return True, computed_root
@@ -211,23 +247,34 @@ def verify_redactable_doc(doc_dict: Mapping[str, Any], expected_root: str | None
 
 def verify_redactable_receipt(receipt: Mapping[str, Any], doc_dict: Mapping[str, Any]) -> bool:
     """Verify a receipt against a (possibly redacted) RedactableDoc dictionary."""
+    if not isinstance(receipt, Mapping) or not isinstance(doc_dict, Mapping):
+        return False
     expected_root = receipt.get("merkle_root")
     leaf_index = receipt.get("leaf_index")
     quote = receipt.get("quote")
     proof = receipt.get("proof")
     if not isinstance(expected_root, str) or not expected_root:
         return False
-    if not isinstance(leaf_index, int) or leaf_index < 0:
+    if not _is_strict_int(leaf_index) or leaf_index < 0:
         return False
-    if not isinstance(quote, str) or not quote:
+    if not isinstance(quote, str) or not quote.strip():
         return False
     if not isinstance(proof, list):
+        return False
+
+    rec_sid = receipt.get("source_id")
+    doc_sid = doc_dict.get("source_id")
+    if isinstance(rec_sid, str) and isinstance(doc_sid, str) and rec_sid and doc_sid and rec_sid != doc_sid:
         return False
 
     ok, _ = verify_redactable_doc(doc_dict, expected_root=expected_root)
     if not ok:
         return False
     entries = doc_dict["entries"]
+    if "leaf_count" in receipt:
+        leaf_count = receipt["leaf_count"]
+        if not _is_strict_int(leaf_count) or leaf_count != len(entries):
+            return False
     if not (0 <= leaf_index < len(entries)):
         return False
     entry = entries[leaf_index]
@@ -236,6 +283,18 @@ def verify_redactable_receipt(receipt: Mapping[str, Any], doc_dict: Mapping[str,
     leaf_text = entry["text"]
     if quote != leaf_text and quote not in leaf_text:
         return False
+
+    if "byte_start" in receipt or "byte_end" in receipt:
+        r_start = receipt.get("byte_start")
+        r_end = receipt.get("byte_end")
+        if not _is_strict_int(r_start) or not _is_strict_int(r_end) or not (0 <= r_start <= r_end):
+            return False
+        if "byte_start" in entry and "byte_end" in entry:
+            e_start = entry["byte_start"]
+            e_end = entry["byte_end"]
+            if not (e_start <= r_start <= r_end <= e_end):
+                return False
+
     computed_leaf = leaf_hash(leaf_text, entry["nonce"])
     return verify_inclusion(
         computed_leaf,
@@ -248,6 +307,16 @@ def verify_redactable_receipt(receipt: Mapping[str, Any], doc_dict: Mapping[str,
 
 def compute_ledger_event_hash(event: Mapping[str, Any]) -> str:
     """Compute canonical SHA-256 event hash covering all fields except `event_hash`."""
+    if not isinstance(event, Mapping):
+        raise ValueError("ledger event must be a mapping")
+    required = ("seq", "tenant_id", "event_id", "kind", "committed_at", "payload", "prev_hash")
+    for key in required:
+        if key not in event:
+            raise KeyError(key)
+    if not _is_strict_int(event["seq"]):
+        raise ValueError("event seq must be an integer")
+    if not isinstance(event["payload"], Mapping):
+        raise ValueError("event payload must be a JSON object")
     hashable = {
         "seq": event["seq"],
         "tenant_id": event["tenant_id"],
@@ -262,23 +331,43 @@ def compute_ledger_event_hash(event: Mapping[str, Any]) -> str:
 
 def verify_ledger_chain(events: Sequence[Mapping[str, Any]]) -> tuple[bool, str]:
     """Verify monotonic gap-free seq, `prev_hash` linkage, and per-event SHA-256 digests."""
+    if not _is_non_string_sequence(events):
+        return False, "ledger_events must be a list of event objects"
     prev_by_tenant: dict[str, str] = {}
     seq_by_tenant: dict[str, int] = {}
     for row_idx, event in enumerate(events):
+        if not isinstance(event, Mapping):
+            return False, f"row {row_idx} is not a JSON object"
         try:
             tenant = event["tenant_id"]
             seq = event["seq"]
             prev_hash = event["prev_hash"]
             stored_hash = event["event_hash"]
+            event_id = event["event_id"]
+            kind = event["kind"]
+            committed_at = event["committed_at"]
+            payload = event["payload"]
         except KeyError as exc:
             return False, f"row {row_idx} missing field {exc}"
+        if not isinstance(tenant, str) or not tenant:
+            return False, f"row {row_idx} has invalid tenant_id"
+        if not _is_strict_int(seq):
+            return False, f"row {row_idx} seq must be an integer"
+        if not all(isinstance(x, str) for x in (prev_hash, stored_hash, event_id, kind, committed_at)):
+            return False, f"row {row_idx} has non-string required metadata"
+        if not isinstance(payload, Mapping):
+            return False, f"row {row_idx} payload must be a JSON object"
+
         expected_seq = seq_by_tenant.get(tenant, 0)
         if seq != expected_seq:
             return False, f"sequence gap for tenant {tenant!r}: expected {expected_seq}, got {seq}"
         expected_prev = prev_by_tenant.get(tenant, GENESIS_HASH)
         if prev_hash != expected_prev:
             return False, f"broken prev_hash for tenant {tenant!r} at seq {seq}"
-        expected_hash = compute_ledger_event_hash(event)
+        try:
+            expected_hash = compute_ledger_event_hash(event)
+        except (TypeError, ValueError, KeyError) as exc:
+            return False, f"malformed event at seq {seq}: {exc}"
         if stored_hash != expected_hash:
             return False, f"invalid event_hash for tenant {tenant!r} at seq {seq}"
         seq_by_tenant[tenant] = expected_seq + 1
@@ -288,6 +377,31 @@ def verify_ledger_chain(events: Sequence[Mapping[str, Any]]) -> tuple[bool, str]
 
 def certificate_signable_bytes(cert: Mapping[str, Any]) -> bytes:
     """Canonical payload covered by an ErasureCertificate's Ed25519 signature."""
+    if not isinstance(cert, Mapping):
+        raise ValueError("certificate must be a JSON object")
+    required = (
+        "certificate_id",
+        "tenant_id",
+        "subject_id",
+        "subject_tokens",
+        "state_hash_before",
+        "state_hash_after",
+        "ledger_tail_hash",
+        "closure",
+        "probe_count",
+        "battery_all_abstained",
+        "cipher",
+        "key_destroyed",
+        "record_keys_destroyed",
+        "issued_at",
+        "trust_boundary",
+    )
+    for key in required:
+        if key not in cert:
+            raise ValueError(f"certificate missing required field {key!r}")
+    if not _is_non_string_sequence(cert["subject_tokens"]):
+        raise ValueError("certificate subject_tokens must be a list")
+
     anchor = cert.get("anchor")
     anchor_payload = (
         {"scheme": anchor.get("scheme", "none"), "digest": anchor.get("digest", ""), "token": anchor.get("token", "")}
@@ -322,8 +436,10 @@ def verify_ed25519_certificate(cert: Mapping[str, Any], public_key_hex: str | No
     Returns `(True, reason)` when valid, `(False, reason)` on tamper/invalid signature, or
     `(None, reason)` when `cryptography` is not installed (refusing to silently pass).
     """
+    if not isinstance(cert, Mapping):
+        return False, "certificate must be a JSON object"
     sig = cert.get("signature", "")
-    pub = public_key_hex or cert.get("public_key", "")
+    pub = public_key_hex if public_key_hex is not None else cert.get("public_key", "")
     if not isinstance(sig, str) or not sig.startswith("ed25519:") or not isinstance(pub, str) or not pub:
         return False, "missing or non-ed25519 signature/public_key"
     try:
@@ -334,42 +450,68 @@ def verify_ed25519_certificate(cert: Mapping[str, Any], public_key_hex: str | No
 
     _, _, hex_sig = sig.partition(":")
     try:
-        pk = ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub))
-        pk.verify(bytes.fromhex(hex_sig), certificate_signable_bytes(cert))
+        pub_bytes = bytes.fromhex(pub)
+        sig_bytes = bytes.fromhex(hex_sig)
+        if len(pub_bytes) != 32 or len(sig_bytes) != 64:
+            return False, "invalid Ed25519 key or signature byte length"
+        pk = ed25519.Ed25519PublicKey.from_public_bytes(pub_bytes)
+        pk.verify(sig_bytes, certificate_signable_bytes(cert))
         return True, "ed25519 signature valid"
-    except (InvalidSignature, ValueError) as exc:
+    except (InvalidSignature, ValueError, TypeError, KeyError) as exc:
         return False, f"invalid ed25519 signature: {exc}"
 
 
 def verify_bundle(bundle: Mapping[str, Any], *, require_signature_check: bool = False) -> dict[str, Any]:
-    """Verify a self-contained Ember verification bundle JSON document."""
+    """Verify a self-contained Ember verification bundle JSON document cleanly (fail-closed)."""
+    if not isinstance(bundle, Mapping):
+        return {"ok": False, "error": "bundle must be a JSON object", "checks": {}}
+
     results: dict[str, Any] = {"ok": True, "checks": {}}
 
     docs = bundle.get("documents", {})
-    docs_ok = True
-    doc_details: dict[str, Any] = {}
-    for source_id, doc_dict in docs.items():
-        ok, info = verify_redactable_doc(doc_dict)
-        doc_details[source_id] = {"ok": ok, "info": info}
-        if not ok:
-            docs_ok = False
-    results["checks"]["documents"] = {"ok": docs_ok, "items": doc_details}
-    if not docs_ok:
+    if not isinstance(docs, Mapping):
+        results["checks"]["documents"] = {"ok": False, "error": "documents must be a JSON object", "items": {}}
         results["ok"] = False
+        docs_map: Mapping[str, Any] = {}
+    else:
+        docs_map = docs
+        docs_ok = True
+        doc_details: dict[str, Any] = {}
+        for source_id, doc_dict in docs.items():
+            sid_key = str(source_id)
+            ok, info = verify_redactable_doc(doc_dict)
+            if ok and isinstance(doc_dict, Mapping):
+                doc_sid = doc_dict.get("source_id")
+                if isinstance(doc_sid, str) and doc_sid and doc_sid != sid_key:
+                    ok, info = False, f"source_id mismatch: key={sid_key!r} != doc.source_id={doc_sid!r}"
+            doc_details[sid_key] = {"ok": ok, "info": info}
+            if not ok:
+                docs_ok = False
+        results["checks"]["documents"] = {"ok": docs_ok, "items": doc_details}
+        if not docs_ok:
+            results["ok"] = False
 
     receipts = bundle.get("receipts", [])
-    receipts_ok = True
-    receipt_details: list[dict[str, Any]] = []
-    for item in receipts:
-        sid = item.get("source_id", "")
-        doc_dict = docs.get(sid)
-        ok = bool(doc_dict is not None and verify_redactable_receipt(item, doc_dict))
-        receipt_details.append({"source_id": sid, "leaf_index": item.get("leaf_index"), "ok": ok})
-        if not ok:
-            receipts_ok = False
-    results["checks"]["receipts"] = {"ok": receipts_ok, "items": receipt_details}
-    if not receipts_ok:
+    if not _is_non_string_sequence(receipts):
+        results["checks"]["receipts"] = {"ok": False, "error": "receipts must be a list", "items": []}
         results["ok"] = False
+    else:
+        receipts_ok = True
+        receipt_details: list[dict[str, Any]] = []
+        for item in receipts:
+            if not isinstance(item, Mapping):
+                receipt_details.append({"source_id": None, "leaf_index": None, "ok": False})
+                receipts_ok = False
+                continue
+            sid = item.get("source_id", "")
+            doc_dict = docs_map.get(sid) if isinstance(sid, str) else None
+            ok = bool(isinstance(doc_dict, Mapping) and verify_redactable_receipt(item, doc_dict))
+            receipt_details.append({"source_id": sid, "leaf_index": item.get("leaf_index"), "ok": ok})
+            if not ok:
+                receipts_ok = False
+        results["checks"]["receipts"] = {"ok": receipts_ok, "items": receipt_details}
+        if not receipts_ok:
+            results["ok"] = False
 
     if "ledger_events" in bundle:
         chain_ok, chain_msg = verify_ledger_chain(bundle["ledger_events"])
@@ -378,23 +520,32 @@ def verify_bundle(bundle: Mapping[str, Any], *, require_signature_check: bool = 
             results["ok"] = False
 
     if "certificates" in bundle:
-        certs_ok = True
-        cert_details: list[dict[str, Any]] = []
-        for cert in bundle["certificates"]:
-            sig_ok, sig_msg = verify_ed25519_certificate(cert)
-            item_ok = (sig_ok is True) if require_signature_check else (sig_ok is not False)
-            cert_details.append(
-                {
-                    "certificate_id": cert.get("certificate_id"),
-                    "verified": sig_ok,
-                    "detail": sig_msg,
-                }
-            )
-            if not item_ok:
-                certs_ok = False
-        results["checks"]["certificates"] = {"ok": certs_ok, "items": cert_details}
-        if not certs_ok:
+        certs = bundle["certificates"]
+        if not _is_non_string_sequence(certs):
+            results["checks"]["certificates"] = {"ok": False, "error": "certificates must be a list", "items": []}
             results["ok"] = False
+        else:
+            certs_ok = True
+            cert_details: list[dict[str, Any]] = []
+            for cert in certs:
+                if not isinstance(cert, Mapping):
+                    cert_details.append({"certificate_id": None, "verified": False, "detail": "certificate must be an object"})
+                    certs_ok = False
+                    continue
+                sig_ok, sig_msg = verify_ed25519_certificate(cert)
+                item_ok = (sig_ok is True) if require_signature_check else (sig_ok is not False)
+                cert_details.append(
+                    {
+                        "certificate_id": cert.get("certificate_id"),
+                        "verified": sig_ok,
+                        "detail": sig_msg,
+                    }
+                )
+                if not item_ok:
+                    certs_ok = False
+            results["checks"]["certificates"] = {"ok": certs_ok, "items": cert_details}
+            if not certs_ok:
+                results["ok"] = False
 
     return results
 
@@ -411,7 +562,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Fail if Ed25519 signatures cannot be verified (requires cryptography)",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
-    data = json.loads(args.bundle.read_text(encoding="utf-8"))
+    try:
+        raw_text = args.bundle.read_text(encoding="utf-8")
+        data = json.loads(raw_text)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(json.dumps({"ok": False, "error": f"failed to read bundle: {exc}", "checks": {}}, indent=2))
+        return 1
     report = verify_bundle(data, require_signature_check=args.require_signature)
     print(json.dumps(report, indent=2))
     return 0 if report["ok"] else 1

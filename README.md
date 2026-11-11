@@ -15,7 +15,7 @@ Existing memory engines (`Mem0`, `Letta`, `LangChain`, vector databases) know ho
 ## Core Guarantees
 
 - **Redactable Salted Merkle Provenance (`ember.merkle`, `ember.receipts`):** Documents split into sentence/line/custom leaves with length-prefixed per-leaf 128-bit random nonces (`0x00 || len32(nonce) || nonce || leaf_bytes`, RFC 6962 domain separation). Erasing Subject A destroys A's plaintext and nonce while keeping A's leaf digest so **Bystander B's inclusion proof still verifies** against the unchanged Merkle root — while offline dictionary guessing of A's redacted leaf fails.
-- **Zero-Plaintext Hash-Chained Ledger + Crypto-Shredding (`ember.ledger`, `ember.crypto`, `ember.keystore`):** Append-only SQLite WAL chain (`synchronous=FULL`) encrypts `subjects`, `text`, and `quote` with `AES-256-GCM` bound via AAD to `(tenant, item_id, field, key_ref)`. Shared and `derived_from` records use tracked per-record keys linked to every upstream contributor — erasing any contributor destroys both their subject CEK and every shared/derived DEK so from-zero replay produces `[erased]`.
+- **Zero-Plaintext Hash-Chained Ledger + Crypto-Shredding (`ember.ledger`, `ember.crypto`, `ember.keystore`):** Append-only SQLite WAL chain (`synchronous=FULL`) encrypts `subjects`, `text`, `quote`, and caller `metadata` with `AES-256-GCM` bound via AAD to `(tenant, item_id, field, key_ref)`. Shared and `derived_from` records use tracked per-record keys linked to every upstream contributor — erasing any contributor destroys both their subject CEK and every shared/derived DEK before issuing external adapter calls, so from-zero replay produces `[erased]` even across transient store timeouts.
 - **Keyed Tombstones & Fail-Closed Certificates (`ember.reducer`, `ember.signing`):** Vault-keyed HMAC-SHA256 tombstones block re-ingestion (`TombstonedSubjectError`) unless an explicit `reconsent_id` is supplied. `erase()` probes the **raw wrapped store directly** and raises `ErasureIncomplete` without issuing an Ed25519 certificate if anything still surfaces.
 - **Zero-Dependency Offline Verifier (`ember/verify.py`):** Copy this single Python stdlib file anywhere to verify Merkle redactions, bystander receipts, and ledger hash chains without third-party packages (`cryptography` is used only when checking Ed25519 certificate signatures).
 
@@ -119,9 +119,10 @@ python examples/offline_verify_bundle.py
 ```bash
 ember --vault .ember --key-dir .keys init
 ember --vault .ember --key-dir .keys add-source doc1 --text "Priya lives in Portland. Marcus lives in Leeds."
-ember --vault .ember --key-dir .keys remember "Priya lives in Portland." --subject priya --source-id doc1
+ember --vault .ember --key-dir .keys remember "Priya lives in Portland." --subject priya --source-id doc1 --meta email=priya@example.org
 ember --vault .ember --key-dir .keys remember "Marcus lives in Leeds." --subject marcus --source-id doc1
 ember --vault .ember --key-dir .keys erase priya --probe "Where does Priya live?"
+ember --vault .ember --key-dir .keys replay
 ember --vault .ember --key-dir .keys export --out bundle.json
 ember verify bundle.json --require-signature
 ```

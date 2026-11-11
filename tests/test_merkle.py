@@ -9,7 +9,6 @@ from ember.merkle import (
     inclusion_proof,
     leaf_hash,
     merkle_root,
-    split_parts,
     split_parts_with_spans,
     verify_inclusion,
 )

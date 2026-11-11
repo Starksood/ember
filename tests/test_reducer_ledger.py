@@ -7,7 +7,6 @@ import sqlite3
 
 import pytest
 
-from ember.keystore import MemoryKeyStore
 from ember.ledger import IdempotencyConflict, LedgerIntegrityError, SQLiteLedger
 from ember.vault import CustodyVault
 
@@ -60,22 +59,38 @@ def test_sqlite_ledger_detects_tampering_deletion_and_reordering(tmp_path):
     vault = CustodyVault.open(tmp_path, key_dir=tmp_path.parent / "sep_keys")
     assert vault.keys_separated_from_ledger is True
     vault.register_source("s1", "Priya joined Acme in 2019. Dana works in Seattle.")
-    vault.remember("Priya joined Acme in 2019.", subjects=["priya"], source_id="s1", quote="Priya joined Acme in 2019.")
-    vault.remember("Dana works in Seattle.", subjects=["dana"], source_id="s1", quote="Dana works in Seattle.")
+    vault.remember(
+        "Priya joined Acme in 2019.",
+        subjects=["priya"],
+        source_id="s1",
+        quote="Priya joined Acme in 2019.",
+        metadata={"user_id": "priya", "email": "priya.raman@acme.example"},
+    )
+    vault.remember(
+        "Dana works in Seattle.",
+        subjects=["dana"],
+        source_id="s1",
+        quote="Dana works in Seattle.",
+        metadata={"user_id": "dana", "email": "dana.kim@acme.example"},
+    )
     vault.close()
 
-    # Inspect raw DB to confirm ZERO plaintext claim/quote/subject strings sit inside ledger_events
+    # Inspect raw DB to confirm ZERO plaintext claim/quote/subject/metadata strings sit inside ledger_events
     conn = sqlite3.connect(db_path)
     raw_rows = conn.execute("SELECT payload_json FROM ledger_events").fetchall()
     blob = " ".join(r[0] for r in raw_rows)
     assert "Priya" not in blob
+    assert "priya.raman@acme.example" not in blob
     assert "Dana" not in blob
+    assert "dana.kim@acme.example" not in blob
     assert "Seattle" not in blob
     assert "Acme" not in blob
 
     # Tamper payload of seq=1 directly in SQLite -> chain check must reject
     row1 = json.loads(raw_rows[1][0])
-    row1["item"]["metadata"]["tampered"] = True
+    assert "metadata" not in row1["item"]
+    assert row1["item"]["metadata_ciphertext"].startswith("enc2:")
+    row1["item"]["tampered"] = True
     conn.execute("UPDATE ledger_events SET payload_json = ? WHERE seq = 1", (json.dumps(row1),))
     conn.commit()
     conn.close()

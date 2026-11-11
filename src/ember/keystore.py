@@ -85,6 +85,9 @@ def _normalize_identifier(value: str) -> str:
     return " ".join(value.strip().lower().split())
 
 
+_FILE_KEYSTORE_LOCK = threading.RLock()
+
+
 class MemoryKeyStore(KeyStore):
     """In-memory mutable keystore for tests, benchmarks, and ephemeral runs."""
 
@@ -98,6 +101,8 @@ class MemoryKeyStore(KeyStore):
         pass
 
     def get_or_create_subject_key(self, subject_id: str) -> bytes:
+        if not isinstance(subject_id, str) or not subject_id.strip():
+            raise ValueError("subject_id must be a non-empty string")
         with self._lock:
             key = self._subject_keys.get(subject_id)
             if key is None:
@@ -111,9 +116,11 @@ class MemoryKeyStore(KeyStore):
             return self._subject_keys.get(subject_id)
 
     def create_record_key(self, record_id: str, subjects: Iterable[str]) -> bytes:
-        owners = frozenset(s for s in subjects if s)
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise ValueError("record_id must be a non-empty string")
+        owners = frozenset(str(s) for s in subjects if str(s).strip())
         if not owners:
-            raise ValueError("a record key must be associated with at least one subject")
+            raise ValueError("a record key must be associated with at least one non-empty subject")
         with self._lock:
             if record_id in self._record_keys:
                 key, _ = self._record_keys[record_id]
@@ -129,6 +136,8 @@ class MemoryKeyStore(KeyStore):
             return entry[0] if entry is not None else None
 
     def shred_subject(self, subject_id: str) -> ShredReport:
+        if not isinstance(subject_id, str) or not subject_id.strip():
+            return ShredReport(subject_id=str(subject_id), subject_key_destroyed=False, record_keys_destroyed=0)
         with self._lock:
             subject_destroyed = self._subject_keys.pop(subject_id, None) is not None
             doomed = [rid for rid, (_, owners) in self._record_keys.items() if subject_id in owners]
@@ -153,7 +162,7 @@ class MemoryKeyStore(KeyStore):
         """Deterministic opaque reference for `subject_id` keyed by vault secret."""
         norm = _normalize_identifier(subject_id)
         if not norm:
-            return ""
+            raise ValueError("subject_id must be non-empty")
         digest = hmac.new(self._tombstone_secret, b"ref:" + norm.encode("utf-8"), hashlib.sha256).hexdigest()
         return f"subj_{digest[:24]}"
 
@@ -190,29 +199,36 @@ class FileKeyStore(MemoryKeyStore):
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        if self.path.exists():
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-            super().__init__(tombstone_secret=base64.b64decode(raw["tombstone_secret"]))
-            for sid, b64 in raw.get("subject_keys", {}).items():
-                self._subject_keys[sid] = base64.b64decode(b64)
-            for rid, rec in raw.get("record_keys", {}).items():
-                self._record_keys[rid] = (base64.b64decode(rec["key"]), frozenset(rec["subjects"]))
-        else:
-            super().__init__()
-            self._persist()
+        with _FILE_KEYSTORE_LOCK:
+            if self.path.exists():
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                super().__init__(tombstone_secret=base64.b64decode(raw["tombstone_secret"]))
+                for sid, b64 in raw.get("subject_keys", {}).items():
+                    self._subject_keys[sid] = base64.b64decode(b64)
+                for rid, rec in raw.get("record_keys", {}).items():
+                    self._record_keys[rid] = (base64.b64decode(rec["key"]), frozenset(rec["subjects"]))
+            else:
+                super().__init__()
+                self._persist()
 
     def _on_mutate(self) -> None:
         self._persist()
 
     def _persist(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        tmp = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(6)}.tmp"
+        )
         payload = json.dumps(self.export_state(), sort_keys=True, indent=2).encode("utf-8")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(fd, payload)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, self.path)
-        os.chmod(self.path, 0o600)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, payload)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, self.path)
+            os.chmod(self.path, 0o600)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise

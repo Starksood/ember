@@ -11,11 +11,12 @@ Encodes the Phase 0 lessons learned from Fireweed:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
 from .adapters import InMemoryStoreAdapter
-from .reducer import TombstonedSubjectError, decrypt_item_payload
+from .reducer import TombstonedSubjectError, decrypt_item_metadata, decrypt_item_payload
 from .vault import CustodyVault
 from .verify import verify_ed25519_certificate
 
@@ -251,7 +252,8 @@ def run_subject_scenario(scenario: SubjectScenario) -> dict[str, Any]:
         for ev in vault.ledger.events(vault.tenant_id):
             if ev.kind == "ADD_ITEM":
                 _, pt, pq = decrypt_item_payload(ev.payload["item"], vault.keystore)
-                combined = f"{pt} {pq or ''}"
+                pmeta = decrypt_item_metadata(ev.payload["item"], vault.keystore)
+                combined = f"{pt} {pq or ''} {json.dumps(pmeta)}"
                 if _contains_marker(combined, scenario.leak_markers):
                     raw_history_clean = False
                     break

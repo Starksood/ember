@@ -113,6 +113,8 @@ def mint_redactable_receipt(
     source_id: str | None = None,
 ) -> Receipt:
     """Mint a receipt binding `quote` to both its exact bytes and its Merkle leaf proof."""
+    if not isinstance(quote, str) or not quote.strip():
+        raise ValueError("quote must be a non-empty string")
     chosen_idx = leaf_index
     matched_quote = quote
 
@@ -152,7 +154,8 @@ def mint_redactable_receipt(
     entry = doc.entries[chosen_idx]
     leaf_bytes = entry["text"].encode("utf-8")
     rel_span = locate_span(leaf_bytes, matched_quote)
-    assert rel_span is not None
+    if rel_span is None:
+        raise ValueError(f"matched quote could not be aligned inside leaf {chosen_idx}")
     byte_start = int(entry["byte_start"]) + rel_span[0]
     byte_end = int(entry["byte_start"]) + rel_span[1]
     flat_hash = sha256_prefixed(raw_doc) if raw_doc is not None else ""

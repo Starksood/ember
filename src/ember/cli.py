@@ -7,9 +7,14 @@ from collections.abc import Sequence
 import json
 from pathlib import Path
 import sys
+from typing import Any
 
+from . import __version__
 from .adapters import SQLiteStoreAdapter
 from .audit import run_benchmark
+from .crypto import DecryptionError, ERASED_TOMBSTONE
+from .ledger import IdempotencyConflict, LedgerIntegrityError
+from .reducer import ErasureIncomplete, InvariantViolation, TombstonedSubjectError
 from .vault import CustodyVault
 from .verify import verify_bundle
 
@@ -18,13 +23,29 @@ def _vault(args: argparse.Namespace) -> tuple[CustodyVault, SQLiteStoreAdapter]:
     data_dir = Path(args.vault)
     key_dir = Path(args.key_dir) if args.key_dir else None
     store = SQLiteStoreAdapter(str(data_dir / "store.db"))
-    vault = CustodyVault.open(
-        data_dir,
-        key_dir=key_dir,
-        tenant_id=args.tenant,
-        adapter=store,
-    )
+    try:
+        vault = CustodyVault.open(
+            data_dir,
+            key_dir=key_dir,
+            tenant_id=args.tenant,
+            adapter=store,
+        )
+    except BaseException:
+        store.close()
+        raise
     return vault, store
+
+
+def _parse_metadata_pairs(pairs: Sequence[str] | None) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    if not pairs:
+        return meta
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"invalid --meta entry {pair!r}; expected KEY=VALUE")
+        meta[key.strip()] = value
+    return meta
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -50,8 +71,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 def _cmd_add_source(args: argparse.Namespace) -> int:
     text = Path(args.file).read_text(encoding="utf-8") if args.file else args.text
-    if not text:
-        raise SystemExit("provide either --text or --file")
+    if text is None or not text:
+        raise ValueError("provide either --text or --file with non-empty content")
     vault, store = _vault(args)
     try:
         rec, _ = vault.register_source(
@@ -70,6 +91,7 @@ def _cmd_add_source(args: argparse.Namespace) -> int:
 
 
 def _cmd_remember(args: argparse.Namespace) -> int:
+    metadata = _parse_metadata_pairs(args.meta)
     vault, store = _vault(args)
     try:
         res = vault.remember(
@@ -78,6 +100,8 @@ def _cmd_remember(args: argparse.Namespace) -> int:
             source_id=args.source_id,
             quote=args.quote,
             derived_from=args.derived_from or (),
+            aliases=args.alias or (),
+            metadata=metadata or None,
             reconsent_id=args.reconsent_id,
         )
         print(
@@ -143,13 +167,55 @@ def _cmd_erase(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _cmd_replay(args: argparse.Namespace) -> int:
+    vault, store = _vault(args)
+    try:
+        chain_ok, chain_msg = vault.ledger.verify_chain(vault.tenant_id)
+        replayed = vault.replay()
+        events = vault.ledger.events(vault.tenant_id)
+        certs = vault.ledger.list_certificates(vault.tenant_id)
+        erased_tombstones = sum(1 for item in replayed.items.values() if item.text == ERASED_TOMBSTONE)
+        print(
+            json.dumps(
+                {
+                    "tenant_id": vault.tenant_id,
+                    "chain_ok": chain_ok,
+                    "chain_detail": chain_msg,
+                    "event_count": len(events),
+                    "source_count": len(replayed.sources),
+                    "live_item_count": len(replayed.items),
+                    "erased_tombstone_tokens": len(replayed.tombstoned_tokens),
+                    "shredded_items_remaining": erased_tombstones,
+                    "certificate_count": len(certs),
+                    "state_digest": replayed.digest(),
+                },
+                indent=2,
+            )
+        )
+        return 0 if chain_ok else 1
+    finally:
+        vault.close()
+        store.close()
+
+
 def _cmd_export(args: argparse.Namespace) -> int:
     vault, store = _vault(args)
     try:
         bundle = vault.export_bundle()
         out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
-        print(json.dumps({"exported": str(out), "documents": len(bundle["documents"]), "receipts": len(bundle["receipts"]), "certificates": len(bundle["certificates"])}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "exported": str(out),
+                    "documents": len(bundle["documents"]),
+                    "receipts": len(bundle["receipts"]),
+                    "certificates": len(bundle["certificates"]),
+                },
+                indent=2,
+            )
+        )
         return 0
     finally:
         vault.close()
@@ -197,6 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ember",
         description="Cryptographic custody, redactable Merkle receipts, and verifiable cascade erasure.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--vault", default=".ember", help="Path to ledger/vault data directory")
     parser.add_argument("--key-dir", default=None, help="Optional separate key storage directory")
     parser.add_argument("--tenant", default="default", help="Tenant identifier")
@@ -219,9 +286,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_rem = sub.add_parser("remember", help="Encrypt and store a custody-backed memory item")
     p_rem.add_argument("text")
     p_rem.add_argument("--subject", action="append", required=True, help="Subject ID (repeatable)")
+    p_rem.add_argument("--alias", action="append", default=None, help="Subject alias (repeatable)")
     p_rem.add_argument("--source-id", default=None)
     p_rem.add_argument("--quote", default=None)
     p_rem.add_argument("--derived-from", action="append", default=None)
+    p_rem.add_argument("--meta", action="append", default=None, help="Encrypted metadata KEY=VALUE (repeatable)")
     p_rem.add_argument("--reconsent-id", default=None)
     p_rem.set_defaults(func=_cmd_remember)
 
@@ -236,6 +305,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_erase.add_argument("--probe", action="append", default=None)
     p_erase.add_argument("--marker", action="append", default=None)
     p_erase.set_defaults(func=_cmd_erase)
+
+    p_rep = sub.add_parser("replay", help="Verify hash chain and replay ledger state from zero")
+    p_rep.set_defaults(func=_cmd_replay)
 
     p_exp = sub.add_parser("export", help="Export offline verification bundle JSON")
     p_exp.add_argument("--out", default="ember-bundle.json")
@@ -256,7 +328,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except (
+        TombstonedSubjectError,
+        ErasureIncomplete,
+        LedgerIntegrityError,
+        IdempotencyConflict,
+        InvariantViolation,
+        DecryptionError,
+        FileNotFoundError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        ValueError,
+        OSError,
+    ) as exc:
+        print(json.dumps({"error": type(exc).__name__, "detail": str(exc)}, indent=2), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

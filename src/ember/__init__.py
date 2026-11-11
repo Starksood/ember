@@ -23,6 +23,8 @@ from .reducer import (
     TombstonedSubjectError,
     apply_event,
     compute_closure,
+    decrypt_item_metadata,
+    decrypt_item_payload,
 )
 from .signing import AnchorReceipt, CallbackAnchor, Ed25519Signer, NullAnchor, TimestampAnchor
 from .vault import CustodyVault, QueryHit, RememberResult, SearchResult
@@ -73,6 +75,8 @@ __all__ = [
     "__version__",
     "apply_event",
     "compute_closure",
+    "decrypt_item_metadata",
+    "decrypt_item_payload",
     "inclusion_proof",
     "leaf_hash",
     "locate_span",

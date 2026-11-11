@@ -19,7 +19,14 @@ import re
 import secrets
 from typing import Any, Literal
 
-from .verify import interior_hash, leaf_hash, merkle_root, redactable_doc_hashes, verify_inclusion
+from .verify import (
+    _is_strict_int,
+    interior_hash,
+    leaf_hash,
+    merkle_root,
+    redactable_doc_hashes,
+    verify_inclusion,
+)
 
 ChunkMode = Literal["sentence", "line", "whole"]
 ChunkerFn = Callable[[str], list[tuple[int, int, str]]]
@@ -44,7 +51,21 @@ def split_parts_with_spans(text: str, mode: ChunkMode | ChunkerFn = "sentence") 
     if not text or not text.strip():
         return []
     if callable(mode):
-        return mode(text)
+        raw_parts = mode(text)
+        text_byte_len = len(text.encode("utf-8"))
+        validated: list[tuple[int, int, str]] = []
+        for entry in raw_parts:
+            if not isinstance(entry, tuple) or len(entry) != 3:
+                raise ValueError("custom chunker must return tuples of (byte_start, byte_end, text)")
+            b_start, b_end, slice_text = entry
+            if not _is_strict_int(b_start) or not _is_strict_int(b_end):
+                raise ValueError("custom chunker offsets must be ints")
+            if not (0 <= b_start <= b_end <= text_byte_len):
+                raise ValueError(f"custom chunker byte range {(b_start, b_end)} out of bounds [0, {text_byte_len}]")
+            if not isinstance(slice_text, str) or not slice_text:
+                raise ValueError("custom chunker leaf text must be a non-empty string")
+            validated.append((b_start, b_end, slice_text))
+        return validated
 
     parts: list[tuple[int, int, str]] = []
     if mode == "whole":
@@ -133,6 +154,8 @@ class RedactableDoc:
             if len(nonces) != len(parts):
                 raise ValueError(f"expected {len(parts)} nonces, got {len(nonces)}")
             leaf_nonces = list(nonces)
+            if any(not isinstance(n, str) or not n for n in leaf_nonces):
+                raise ValueError("every leaf nonce must be a non-empty string")
         entries = tuple(
             {
                 "index": idx,
@@ -141,7 +164,7 @@ class RedactableDoc:
                 "byte_start": b_start,
                 "byte_end": b_end,
             }
-            for idx, ((b_start, b_end, part), nonce) in enumerate(zip(parts, leaf_nonces))
+            for idx, ((b_start, b_end, part), nonce) in enumerate(zip(parts, leaf_nonces, strict=True))
         )
         mode_name = mode if isinstance(mode, str) else getattr(mode, "__name__", "custom")
         return cls(source_id=source_id, chunk_mode=mode_name, entries=entries)

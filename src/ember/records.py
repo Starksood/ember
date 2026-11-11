@@ -67,16 +67,17 @@ class MemoryItem:
     text_ciphertext: str
     subjects_ciphertext: str
     quote_ciphertext: str | None = None
+    metadata_ciphertext: str | None = None
     receipt_meta: dict[str, Any] | None = None
     derived_from: tuple[str, ...] = ()
     adapter_record_ids: tuple[str, ...] = ()
     created_at: str = ""
-    metadata: dict[str, Any] = field(default_factory=dict)
     reconsent_id: str | None = None
     # Transient decrypted values held in materialized state (never serialized into ledger)
     subjects: tuple[str, ...] = ()
     text: str | None = None
     quote: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def ledger_payload(self) -> dict[str, Any]:
         """Serialize ONLY encrypted fields and structural coordinates for append-only storage."""
@@ -89,11 +90,11 @@ class MemoryItem:
             "text_ciphertext": self.text_ciphertext,
             "subjects_ciphertext": self.subjects_ciphertext,
             "quote_ciphertext": self.quote_ciphertext,
+            "metadata_ciphertext": self.metadata_ciphertext,
             "receipt_meta": self.receipt_meta,
             "derived_from": list(self.derived_from),
             "adapter_record_ids": list(self.adapter_record_ids),
             "created_at": self.created_at,
-            "metadata": dict(self.metadata),
             "reconsent_id": self.reconsent_id,
         }
 
@@ -105,7 +106,9 @@ class MemoryItem:
         subjects: tuple[str, ...] = (),
         text: str | None = None,
         quote: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> "MemoryItem":
+        resolved_meta = dict(metadata) if metadata is not None else dict(data.get("metadata") or {})
         return cls(
             item_id=str(data["item_id"]),
             tenant_id=str(data["tenant_id"]),
@@ -115,15 +118,16 @@ class MemoryItem:
             text_ciphertext=str(data["text_ciphertext"]),
             subjects_ciphertext=str(data["subjects_ciphertext"]),
             quote_ciphertext=data.get("quote_ciphertext"),
+            metadata_ciphertext=data.get("metadata_ciphertext"),
             receipt_meta=dict(data["receipt_meta"]) if data.get("receipt_meta") else None,
             derived_from=tuple(str(d) for d in data.get("derived_from", ())),
             adapter_record_ids=tuple(str(r) for r in data.get("adapter_record_ids", ())),
             created_at=str(data.get("created_at", "")),
-            metadata=dict(data.get("metadata") or {}),
             reconsent_id=data.get("reconsent_id"),
             subjects=subjects,
             text=text,
             quote=quote,
+            metadata=resolved_meta,
         )
 
 

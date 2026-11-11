@@ -25,7 +25,7 @@ from typing import Any
 from .keystore import KeyStore
 from .merkle import RedactableDoc
 from .records import LedgerEvent
-from .reducer import EmberState, InvariantViolation, apply_event
+from .reducer import EmberState, apply_event
 from .verify import (
     GENESIS_HASH,
     canonical_bytes,

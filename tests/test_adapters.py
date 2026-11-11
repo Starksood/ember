@@ -96,7 +96,7 @@ class FakeVectorStore:
         self.docs: dict[str, _VecDoc] = {}
 
     def add_texts(self, texts: list[str], metadatas: list[dict[str, Any]], ids: list[str]) -> list[str]:
-        for t, m, i in zip(texts, metadatas, ids):
+        for t, m, i in zip(texts, metadatas, ids, strict=True):
             self.docs[i] = _VecDoc(id=i, page_content=t, metadata=dict(m))
         return list(ids)
 

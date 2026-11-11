@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import secrets
+import threading
 from typing import Any, Protocol
 
 from cryptography.hazmat.primitives import serialization
@@ -56,6 +58,9 @@ class CallbackAnchor:
         return AnchorReceipt(scheme=self.scheme, digest=digest_hex, token=token)
 
 
+_SIGNER_FILE_LOCK = threading.RLock()
+
+
 class Ed25519Signer:
     """Adversary-checkable Ed25519 signer (private key signs, hex public key verifies)."""
 
@@ -78,30 +83,35 @@ class Ed25519Signer:
     @classmethod
     def load_or_create(cls, path: str | Path) -> "Ed25519Signer":
         p = Path(path)
-        if p.exists():
-            data = json.loads(p.read_text(encoding="utf-8"))
-            return cls(bytes.fromhex(data["private_key_hex"]))
-        signer = cls.generate()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
-        payload = json.dumps(
-            {
-                "scheme": cls.scheme,
-                "private_key_hex": signer.private_bytes().hex(),
-                "public_key_hex": signer.public_key_hex,
-            },
-            indent=2,
-            sort_keys=True,
-        ).encode("utf-8")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, payload)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, p)
-        os.chmod(p, 0o600)
-        return signer
+        with _SIGNER_FILE_LOCK:
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                return cls(bytes.fromhex(data["private_key_hex"]))
+            signer = cls.generate()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(6)}.tmp")
+            payload = json.dumps(
+                {
+                    "scheme": cls.scheme,
+                    "private_key_hex": signer.private_bytes().hex(),
+                    "public_key_hex": signer.public_key_hex,
+                },
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(fd, payload)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.replace(tmp, p)
+                os.chmod(p, 0o600)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+            return signer
 
     def private_bytes(self) -> bytes:
         return self._sk.private_bytes(

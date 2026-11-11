@@ -53,7 +53,7 @@ class MemoryStoreAdapter(Protocol):
     def delete(self, record_ids: Sequence[str]) -> int: ...
 
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
 
 def _tokenize(text: str) -> set[str]:
@@ -150,6 +150,8 @@ class InMemoryStoreAdapter:
         limit: int = 5,
         filters: dict[str, Any] | None = None,
     ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
         q_toks = _content_tokens(query)
         scored: list[AdapterHit] = []
         with self._lock:
@@ -261,6 +263,8 @@ class SQLiteStoreAdapter:
     ) -> list[AdapterHit]:
         import json
 
+        if limit <= 0:
+            return []
         q_toks = _content_tokens(query)
         with self._lock:
             rows = self._conn.execute(
@@ -291,12 +295,14 @@ class SQLiteStoreAdapter:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                cur = self._conn.executemany(
+                before = self._conn.total_changes
+                self._conn.executemany(
                     "DELETE FROM external_memories WHERE record_id = ?",
                     [(rid,) for rid in record_ids],
                 )
+                deleted = max(0, self._conn.total_changes - before)
                 self._conn.execute("COMMIT")
-                return max(0, cur.rowcount)
+                return deleted
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
@@ -347,14 +353,15 @@ class Mem0Adapter:
 
         sig = inspect.signature(self.client.add)
         accepted = set(sig.parameters)
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in accepted or has_varkw}
         if "messages" in accepted:
-            filtered_kwargs = {k: v for k, v in kwargs.items() if k in accepted or any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )}
             raw = self.client.add(messages=text, **filtered_kwargs)
         else:
-            raw = self.client.add(text, **kwargs)
+            raw = self.client.add(text, **filtered_kwargs)
 
+        if raw is None:
+            return ()
         rows = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
         ids: list[str] = []
         for entry in rows:
@@ -371,6 +378,8 @@ class Mem0Adapter:
         limit: int = 5,
         filters: dict[str, Any] | None = None,
     ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
         sig = inspect.signature(self.client.search)
         params = set(sig.parameters)
         kwargs: dict[str, Any] = {}
@@ -384,6 +393,8 @@ class Mem0Adapter:
                     if k in params:
                         kwargs[k] = v
         raw = self.client.search(query, **kwargs)
+        if raw is None:
+            return []
         rows = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
         hits: list[AdapterHit] = []
         for entry in rows:
@@ -435,10 +446,18 @@ class VectorStoreAdapter:
     ) -> tuple[str, ...]:
         meta = {**metadata, "ember_item_id": item_id, "ember_subjects": list(subjects)}
         rec_id = f"vec_{uuid.uuid4().hex[:12]}"
-        returned = self.store.add_texts(texts=[text], metadatas=[meta], ids=[rec_id])
+        sig = inspect.signature(self.store.add_texts)
+        params = set(sig.parameters)
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        kwargs: dict[str, Any] = {}
+        if "metadatas" in params or has_varkw:
+            kwargs["metadatas"] = [meta]
+        if "ids" in params or has_varkw:
+            kwargs["ids"] = [rec_id]
+        returned = self.store.add_texts(texts=[text], **kwargs)
         if isinstance(returned, (list, tuple)) and returned:
             return tuple(str(x) for x in returned)
-        return (rec_id,)
+        return (rec_id,) if ("ids" in kwargs) else ()
 
     def search(
         self,
@@ -447,9 +466,16 @@ class VectorStoreAdapter:
         limit: int = 5,
         filters: dict[str, Any] | None = None,
     ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
         if hasattr(self.store, "similarity_search_with_score"):
-            kwargs = {"k": limit}
-            if filters is not None:
+            sig = inspect.signature(self.store.similarity_search_with_score)
+            params = set(sig.parameters)
+            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            kwargs: dict[str, Any] = {}
+            if "k" in params or has_varkw:
+                kwargs["k"] = limit
+            if filters is not None and ("filter" in params or has_varkw):
                 kwargs["filter"] = filters
             pairs = self.store.similarity_search_with_score(query, **kwargs)
             hits: list[AdapterHit] = []
@@ -463,9 +489,14 @@ class VectorStoreAdapter:
                         metadata=meta,
                     )
                 )
-            return hits
-        kwargs = {"k": limit}
-        if filters is not None:
+            return hits[:limit]
+        sig = inspect.signature(self.store.similarity_search)
+        params = set(sig.parameters)
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        kwargs = {}
+        if "k" in params or has_varkw:
+            kwargs["k"] = limit
+        if filters is not None and ("filter" in params or has_varkw):
             kwargs["filter"] = filters
         docs = self.store.similarity_search(query, **kwargs)
         return [
@@ -476,13 +507,18 @@ class VectorStoreAdapter:
                 metadata=dict(getattr(doc, "metadata", {}) or {}),
             )
             for doc in docs
-        ]
+        ][:limit]
 
     def delete(self, record_ids: Sequence[str]) -> int:
-        ids = [rid for rid in record_ids if rid]
+        ids = list(dict.fromkeys(rid for rid in record_ids if rid))
         if not ids:
             return 0
-        self.store.delete(ids=ids)
+        sig = inspect.signature(self.store.delete)
+        params = set(sig.parameters)
+        if "ids" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            self.store.delete(ids=ids)
+        else:
+            self.store.delete(ids)
         return len(ids)
 
 

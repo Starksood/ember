@@ -13,9 +13,9 @@ Ember aims to make security guarantees **explicit and falsifiable**, never aspir
    - Events form a gap-free per-tenant SHA-256 chain (`WAL`, `PRAGMA synchronous=FULL`). Editing, dropping, or reordering any event breaks validation unless an attacker controls and re-seals the entire tail from the edited event onward.
 
 3. **Durable Crypto-Shredding & Cascade Closure (`ember.crypto`, `ember.keystore`, `ember.reducer`, `ember.vault`):**
-   - Content fields and quoted spans are encrypted with `AES-256-GCM` bound via AAD to `(tenant, record_id, field, key_id)`.
-   - Shared or derived records (`derived_from` chains) receive tracked per-record keys linked to every contributing subject; erasing any contributing subject destroys the record key so from-zero replay produces `[erased]` tombstones instead of plaintext.
-   - Erasure computes exact structural + transitive closure, cascades deletion to external memory/vector store IDs, redacts shared source-document leaves, persists a keyed HMAC tombstone token blocking silent re-ingestion, and gates certificate signing on post-erasure adversarial probes (`ErasureIncomplete` fails closed without issuing a certificate).
+   - Content fields (`subjects`, `text`), caller `metadata`, and quoted spans are encrypted with `AES-256-GCM` bound via AAD to `(tenant, record_id, field, key_ref)`.
+   - Shared or derived records (`derived_from` chains) receive tracked per-record keys linked to every contributing subject; erasing any contributing subject destroys the record key so from-zero replay produces `[erased]` tombstones and `{}` metadata instead of plaintext.
+   - Erasure computes exact structural + transitive closure, commits the keyed `ERASE_SUBJECT` event, redacts source-document leaves and shreds encryption keys **before** external adapter network deletion (preventing transient SaaS/vector DB timeouts from leaving local keys alive, and allowing safe retries), persists a keyed HMAC tombstone token blocking silent re-ingestion, and gates certificate signing on post-erasure adversarial probes (`ErasureIncomplete` fails closed without issuing a certificate).
 
 ## Explicit Boundaries (Honest Limitations)
 
