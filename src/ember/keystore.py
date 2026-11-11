@@ -73,6 +73,23 @@ class KeyStore(ABC):
     @abstractmethod
     def subject_ref(self, subject_id: str) -> str: ...
 
+    def content_tombstone_token(self, identifier: str) -> str:
+        """Domain-separated keyed HMAC token used for content-level zombie ingest blocking."""
+        norm = _normalize_identifier(identifier)
+        if not norm:
+            return ""
+        return self.tombstone_token("\x00content:" + norm)
+
+    def blind_token(self, token: str) -> str:
+        """Domain-separated keyed HMAC search token for Zero-Plaintext blind-index search."""
+        norm = _normalize_identifier(token)
+        if not norm:
+            return ""
+        raw = self.tombstone_token("\x00blind:" + norm)
+        _, _, hex_part = raw.partition(":")
+        digest = hex_part or hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        return f"bt{digest[:24]}"
+
     def key_for(self, key_kind: str, key_id: str) -> bytes | None:
         if key_kind == "subject":
             return self.get_subject_key(key_id)

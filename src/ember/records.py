@@ -166,9 +166,10 @@ class ClosureManifest:
     derived_invalidated: tuple[str, ...]
     source_leaves_redacted: dict[str, list[int]]
     adapter_record_ids: tuple[str, ...]
+    source_spans_redacted: dict[str, dict[int, list[int]]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "subject_id": self.subject_id,
             "item_ids": list(self.item_ids),
             "derived_invalidated": list(self.derived_invalidated),
@@ -177,6 +178,12 @@ class ClosureManifest:
             },
             "adapter_record_ids": list(self.adapter_record_ids),
         }
+        if self.source_spans_redacted:
+            out["source_spans_redacted"] = {
+                sid: {str(leaf_idx): sorted(spans) for leaf_idx, spans in sorted(leaf_map.items())}
+                for sid, leaf_map in sorted(self.source_spans_redacted.items())
+            }
+        return out
 
 
 @dataclass(frozen=True)

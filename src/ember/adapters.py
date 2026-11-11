@@ -10,6 +10,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 import hashlib
 import inspect
+import json
+import math
 from pathlib import Path
 import re
 import sqlite3
@@ -26,6 +28,27 @@ class AdapterHit:
     text: str
     score: float
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AdapterOp:
+    """Lifecycle operation emitted by adapters supporting in-place mutations/consolidations."""
+
+    record_id: str
+    event: str = "ADD"  # "ADD", "UPDATE", "DELETE", or "NONE"
+    memory: str = ""
+    previous_memory: str | None = None
+
+
+def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+    if len(a) != len(b) or not a:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / (na * nb)
 
 
 @runtime_checkable
@@ -114,7 +137,7 @@ def _matches_filters(metadata: dict[str, Any], filters: dict[str, Any] | None) -
 
 
 class InMemoryStoreAdapter:
-    """Deterministic keyword-overlap store useful for unit tests, benchmarks, and baselines."""
+    """Deterministic keyword-overlap & dense-vector store useful for tests, benchmarks, and baselines."""
 
     name = "in-memory"
 
@@ -129,11 +152,12 @@ class InMemoryStoreAdapter:
         text: str,
         subjects: tuple[str, ...],
         metadata: dict[str, Any],
+        vector: Sequence[float] | None = None,
     ) -> tuple[str, ...]:
         rec_id = f"mem_{uuid.uuid4().hex[:12]}"
         meta = dict(metadata)
         meta.setdefault("ember_item_id", item_id)
-        if subjects and "user_id" not in meta:
+        if subjects and "user_id" not in meta and not meta.get("ember_encrypted"):
             meta["user_id"] = subjects[0]
         with self._lock:
             self._records[rec_id] = {
@@ -141,6 +165,7 @@ class InMemoryStoreAdapter:
                 "text": text,
                 "subjects": list(subjects),
                 "metadata": meta,
+                "vector": [float(x) for x in vector] if vector is not None else None,
             }
         return (rec_id,)
 
@@ -169,6 +194,39 @@ class InMemoryStoreAdapter:
                         record_id=rec["record_id"],
                         text=rec["text"],
                         score=score,
+                        metadata=dict(rec["metadata"]),
+                    )
+                )
+        scored.sort(key=lambda h: (-h.score, h.record_id))
+        return scored[:limit]
+
+    def search_vector(
+        self,
+        query_vector: Sequence[float],
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+        min_score: float = 0.0,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        q_vec = [float(x) for x in query_vector]
+        scored: list[AdapterHit] = []
+        with self._lock:
+            for rec in self._records.values():
+                if not _matches_filters(rec["metadata"], filters):
+                    continue
+                rec_vec = rec.get("vector")
+                if not rec_vec:
+                    continue
+                sim = _cosine_similarity(q_vec, rec_vec)
+                if sim <= min_score:
+                    continue
+                scored.append(
+                    AdapterHit(
+                        record_id=rec["record_id"],
+                        text=rec["text"],
+                        score=sim,
                         metadata=dict(rec["metadata"]),
                     )
                 )
@@ -215,13 +273,17 @@ class SQLiteStoreAdapter:
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS external_memories (
-                record_id TEXT PRIMARY KEY,
-                item_id   TEXT NOT NULL,
-                text      TEXT NOT NULL,
-                meta_json TEXT NOT NULL
+                record_id   TEXT PRIMARY KEY,
+                item_id     TEXT NOT NULL,
+                text        TEXT NOT NULL,
+                meta_json   TEXT NOT NULL,
+                vector_json TEXT
             )
             """
         )
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(external_memories)").fetchall()}
+        if "vector_json" not in cols:
+            self._conn.execute("ALTER TABLE external_memories ADD COLUMN vector_json TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -234,20 +296,23 @@ class SQLiteStoreAdapter:
         text: str,
         subjects: tuple[str, ...],
         metadata: dict[str, Any],
+        vector: Sequence[float] | None = None,
     ) -> tuple[str, ...]:
-        import json
-
         rec_id = f"sql_{uuid.uuid4().hex[:12]}"
         meta = dict(metadata)
         meta.setdefault("ember_item_id", item_id)
-        if subjects and "user_id" not in meta:
+        if subjects and "user_id" not in meta and not meta.get("ember_encrypted"):
             meta["user_id"] = subjects[0]
+        vec_json = json.dumps([float(x) for x in vector]) if vector is not None else None
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute(
-                    "INSERT INTO external_memories (record_id, item_id, text, meta_json) VALUES (?, ?, ?, ?)",
-                    (rec_id, item_id, text, json.dumps(meta, sort_keys=True)),
+                    """
+                    INSERT INTO external_memories (record_id, item_id, text, meta_json, vector_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (rec_id, item_id, text, json.dumps(meta, sort_keys=True), vec_json),
                 )
                 self._conn.execute("COMMIT")
             except BaseException:
@@ -262,8 +327,6 @@ class SQLiteStoreAdapter:
         limit: int = 5,
         filters: dict[str, Any] | None = None,
     ) -> list[AdapterHit]:
-        import json
-
         if limit <= 0:
             return []
         q_toks = _content_tokens(query)
@@ -284,6 +347,42 @@ class SQLiteStoreAdapter:
                     record_id=rec_id,
                     text=text,
                     score=overlap / max(1, len(q_toks)),
+                    metadata=meta,
+                )
+            )
+        scored.sort(key=lambda h: (-h.score, h.record_id))
+        return scored[:limit]
+
+    def search_vector(
+        self,
+        query_vector: Sequence[float],
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+        min_score: float = 0.0,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        q_vec = [float(x) for x in query_vector]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT record_id, text, meta_json, vector_json FROM external_memories "
+                "WHERE vector_json IS NOT NULL ORDER BY rowid ASC"
+            ).fetchall()
+        scored: list[AdapterHit] = []
+        for rec_id, text, meta_json, vec_json in rows:
+            meta = json.loads(meta_json)
+            if not _matches_filters(meta, filters):
+                continue
+            rec_vec = json.loads(vec_json)
+            sim = _cosine_similarity(q_vec, rec_vec)
+            if sim <= min_score:
+                continue
+            scored.append(
+                AdapterHit(
+                    record_id=rec_id,
+                    text=text,
+                    score=sim,
                     metadata=meta,
                 )
             )
@@ -372,6 +471,7 @@ class Mem0Adapter:
         self._lock = threading.RLock()
         self._scopes: list[dict[str, str]] = []
         self._scope_keys: set[tuple[tuple[str, str], ...]] = set()
+        self._direct_vector_ids: set[str] = set()
         if default_user_id or default_agent_id or default_run_id:
             self.register_scope(
                 user_id=default_user_id,
@@ -423,20 +523,25 @@ class Mem0Adapter:
         with self._lock:
             return [dict(scope) for scope in self._scopes]
 
-    def upsert(
+    def upsert_detailed(
         self,
         *,
         item_id: str,
         text: str,
         subjects: tuple[str, ...],
         metadata: dict[str, Any],
-    ) -> tuple[str, ...]:
+        vector: Sequence[float] | None = None,
+    ) -> tuple[AdapterOp, ...]:
         meta = dict(metadata)
+        encrypted_mode = bool(meta.get("ember_encrypted"))
         raw_user_id = meta.pop("user_id", None)
         raw_agent_id = meta.pop("agent_id", None)
         raw_run_id = meta.pop("run_id", None)
         meta["ember_item_id"] = item_id
-        meta["ember_subjects"] = list(subjects)
+        if encrypted_mode:
+            meta["ember_subject_refs"] = list(subjects)
+        else:
+            meta["ember_subjects"] = list(subjects)
 
         eff_raw_user_id = raw_user_id if raw_user_id is not None else (
             self.default_user_id if self.default_user_id is not None else (subjects[0] if subjects else None)
@@ -448,14 +553,34 @@ class Mem0Adapter:
         agent_id = self.normalize_entity_id(eff_raw_agent_id)
         run_id = self.normalize_entity_id(eff_raw_run_id)
 
-        if eff_raw_user_id is not None and user_id != str(eff_raw_user_id).strip():
-            meta.setdefault("ember_user_id", str(eff_raw_user_id).strip())
-        if eff_raw_agent_id is not None and agent_id != str(eff_raw_agent_id).strip():
-            meta.setdefault("ember_agent_id", str(eff_raw_agent_id).strip())
-        if eff_raw_run_id is not None and run_id != str(eff_raw_run_id).strip():
-            meta.setdefault("ember_run_id", str(eff_raw_run_id).strip())
+        if not encrypted_mode:
+            if eff_raw_user_id is not None and user_id != str(eff_raw_user_id).strip():
+                meta.setdefault("ember_user_id", str(eff_raw_user_id).strip())
+            if eff_raw_agent_id is not None and agent_id != str(eff_raw_agent_id).strip():
+                meta.setdefault("ember_agent_id", str(eff_raw_agent_id).strip())
+            if eff_raw_run_id is not None and run_id != str(eff_raw_run_id).strip():
+                meta.setdefault("ember_run_id", str(eff_raw_run_id).strip())
 
-        kwargs: dict[str, Any] = {"metadata": meta, "infer": self.infer}
+        if vector is not None and hasattr(self.client, "vector_store"):
+            vs = self.client.vector_store
+            insert_fn = getattr(vs, "insert", None)
+            if callable(insert_fn):
+                rec_id = str(uuid.uuid4())
+                payload = {**meta, "data": text}
+                if user_id is not None:
+                    payload["user_id"] = user_id
+                if agent_id is not None:
+                    payload["agent_id"] = agent_id
+                if run_id is not None:
+                    payload["run_id"] = run_id
+                insert_fn(vectors=[list(float(x) for x in vector)], ids=[rec_id], payloads=[payload])
+                with self._lock:
+                    self._direct_vector_ids.add(rec_id)
+                self.register_scope(user_id=user_id, agent_id=agent_id, run_id=run_id)
+                return (AdapterOp(record_id=rec_id, event="ADD", memory=text),)
+
+        effective_infer = False if encrypted_mode else self.infer
+        kwargs: dict[str, Any] = {"metadata": meta, "infer": effective_infer}
         if user_id is not None:
             kwargs["user_id"] = user_id
         if agent_id is not None:
@@ -477,13 +602,110 @@ class Mem0Adapter:
         if raw is None:
             return ()
         rows = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
-        ids: list[str] = []
+        ops: list[AdapterOp] = []
         for entry in rows:
-            if isinstance(entry, dict) and entry.get("id"):
-                ids.append(str(entry["id"]))
-        if not ids and isinstance(raw, dict) and raw.get("id"):
-            ids.append(str(raw["id"]))
-        return tuple(ids)
+            if not isinstance(entry, dict):
+                continue
+            rid = entry.get("id")
+            if not rid:
+                continue
+            ops.append(
+                AdapterOp(
+                    record_id=str(rid),
+                    event=str(entry.get("event") or "ADD").upper(),
+                    memory=str(entry.get("memory") or entry.get("text") or ""),
+                    previous_memory=(
+                        str(entry["previous_memory"])
+                        if entry.get("previous_memory") is not None
+                        else (str(entry["prev_memory"]) if entry.get("prev_memory") is not None else None)
+                    ),
+                )
+            )
+        if not ops and isinstance(raw, dict) and raw.get("id"):
+            ops.append(
+                AdapterOp(
+                    record_id=str(raw["id"]),
+                    event=str(raw.get("event") or "ADD").upper(),
+                    memory=str(raw.get("memory") or raw.get("text") or ""),
+                )
+            )
+        return tuple(ops)
+
+    def upsert(
+        self,
+        *,
+        item_id: str,
+        text: str,
+        subjects: tuple[str, ...],
+        metadata: dict[str, Any],
+        vector: Sequence[float] | None = None,
+    ) -> tuple[str, ...]:
+        ops = self.upsert_detailed(
+            item_id=item_id,
+            text=text,
+            subjects=subjects,
+            metadata=metadata,
+            vector=vector,
+        )
+        return tuple(op.record_id for op in ops if op.record_id and op.event != "DELETE")
+
+    def search_vector(
+        self,
+        query_vector: Sequence[float],
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[AdapterHit]:
+        if limit <= 0 or not hasattr(self.client, "vector_store"):
+            return []
+        vs = self.client.vector_store
+        search_fn = getattr(vs, "search", None)
+        if not callable(search_fn):
+            return []
+        norm_filters = self._normalize_filters(filters)
+        sig = inspect.signature(search_fn)
+        params = set(sig.parameters)
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        q_vec = [list(float(x) for x in query_vector)]
+
+        scopes = self.registered_scopes()
+        query_scopes: list[dict[str, Any]]
+        if any(norm_filters.get(k) is not None for k in ("user_id", "agent_id", "run_id")):
+            query_scopes = [norm_filters]
+        elif scopes:
+            query_scopes = [{**scope, **norm_filters} for scope in scopes]
+        else:
+            query_scopes = [norm_filters] if norm_filters else [{}]
+
+        merged: dict[str, AdapterHit] = {}
+        for qf in query_scopes:
+            kwargs: dict[str, Any] = {}
+            if "vectors" in params or has_varkw:
+                kwargs["vectors"] = q_vec
+            if "query" in params:
+                kwargs["query"] = ""
+            if "top_k" in params or has_varkw:
+                kwargs["top_k"] = limit
+            elif "limit" in params:
+                kwargs["limit"] = limit
+            if qf and ("filters" in params or has_varkw):
+                kwargs["filters"] = qf
+            rows = search_fn(**kwargs) or []
+            for row in rows:
+                rid = str(getattr(row, "id", "") or (row.get("id", "") if isinstance(row, Mapping) else ""))
+                payload = getattr(row, "payload", None)
+                if payload is None and isinstance(row, Mapping):
+                    payload = row.get("payload") or row
+                payload_dict = dict(payload or {})
+                score = float(getattr(row, "score", 0.0) if not isinstance(row, Mapping) else row.get("score", 0.0))
+                txt = str(payload_dict.get("data") or payload_dict.get("memory") or payload_dict.get("text") or "")
+                hit = AdapterHit(record_id=rid, text=txt, score=score, metadata=payload_dict)
+                prev = merged.get(rid)
+                if prev is None or hit.score > prev.score:
+                    merged[rid] = hit
+        hits = list(merged.values())
+        hits.sort(key=lambda h: (-h.score, h.record_id))
+        return hits[:limit]
 
     def _rows_to_hits(self, raw: Any) -> list[AdapterHit]:
         if raw is None:
@@ -590,29 +812,61 @@ class Mem0Adapter:
         hits.sort(key=lambda h: (-h.score, h.record_id))
         return hits[:limit]
 
+    def _delete_direct_vector(self, rid: str) -> bool:
+        vs = getattr(self.client, "vector_store", None)
+        vs_del = getattr(vs, "delete", None) if vs is not None else None
+        if not callable(vs_del):
+            return False
+        vs_sig = inspect.signature(vs_del)
+        params = set(vs_sig.parameters)
+        try:
+            if "vector_id" in params:
+                vs_del(vector_id=rid)
+            elif "ids" in params:
+                vs_del(ids=[rid])
+            elif "id" in params:
+                vs_del(id=rid)
+            else:
+                vs_del(rid)
+            return True
+        except ValueError as exc:
+            if "not found" in str(exc).lower():
+                return False
+            raise
+
     def delete(self, record_ids: Sequence[str]) -> int:
         deleted = 0
         ids = list(dict.fromkeys(str(rid) for rid in record_ids if rid))
         if not ids:
             return 0
-        sig = inspect.signature(self.client.delete)
-        use_kw = "memory_id" in sig.parameters
+        delete_fn = getattr(self.client, "delete", None)
+        use_kw = False
+        if callable(delete_fn):
+            sig = inspect.signature(delete_fn)
+            use_kw = "memory_id" in sig.parameters
         for rid in ids:
-            try:
-                try:
-                    if use_kw:
-                        self.client.delete(memory_id=rid)
-                    else:
-                        self.client.delete(rid)
-                except TypeError:
-                    self.client.delete(rid)
+            with self._lock:
+                is_direct = rid in self._direct_vector_ids
+                self._direct_vector_ids.discard(rid)
+            if is_direct and self._delete_direct_vector(rid):
                 deleted += 1
-            except ValueError as exc:
-                # Retry-safe idempotency: Mem0 2.x raises ValueError("Memory with id ... not found")
-                # if an earlier interrupted delete pass already removed the record from the vector store.
-                if "not found" in str(exc).lower():
+                continue
+            if callable(delete_fn):
+                try:
+                    try:
+                        if use_kw:
+                            delete_fn(memory_id=rid)
+                        else:
+                            delete_fn(rid)
+                    except TypeError:
+                        delete_fn(rid)
+                    deleted += 1
                     continue
-                raise
+                except ValueError as exc:
+                    if "not found" not in str(exc).lower():
+                        raise
+            if self._delete_direct_vector(rid):
+                deleted += 1
         return deleted
 
 
@@ -631,13 +885,35 @@ class VectorStoreAdapter:
         text: str,
         subjects: tuple[str, ...],
         metadata: dict[str, Any],
+        vector: Sequence[float] | None = None,
     ) -> tuple[str, ...]:
-        meta = {**metadata, "ember_item_id": item_id, "ember_subjects": list(subjects)}
+        encrypted_mode = bool(metadata.get("ember_encrypted"))
+        meta = dict(metadata)
+        meta["ember_item_id"] = item_id
+        if encrypted_mode:
+            meta["ember_subject_refs"] = list(subjects)
+        else:
+            meta["ember_subjects"] = list(subjects)
         rec_id = f"vec_{uuid.uuid4().hex[:12]}"
+
+        if vector is not None and hasattr(self.store, "add_embeddings"):
+            sig = inspect.signature(self.store.add_embeddings)
+            params = set(sig.parameters)
+            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            kwargs: dict[str, Any] = {}
+            if "metadatas" in params or has_varkw:
+                kwargs["metadatas"] = [meta]
+            if "ids" in params or has_varkw:
+                kwargs["ids"] = [rec_id]
+            returned = self.store.add_embeddings(text_embeddings=[(text, [float(x) for x in vector])], **kwargs)
+            if isinstance(returned, (list, tuple)) and returned:
+                return tuple(str(x) for x in returned)
+            return (rec_id,) if ("ids" in kwargs) else ()
+
         sig = inspect.signature(self.store.add_texts)
         params = set(sig.parameters)
         has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-        kwargs: dict[str, Any] = {}
+        kwargs = {}
         if "metadatas" in params or has_varkw:
             kwargs["metadatas"] = [meta]
         if "ids" in params or has_varkw:
@@ -646,6 +922,52 @@ class VectorStoreAdapter:
         if isinstance(returned, (list, tuple)) and returned:
             return tuple(str(x) for x in returned)
         return (rec_id,) if ("ids" in kwargs) else ()
+
+    def search_vector(
+        self,
+        query_vector: Sequence[float],
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        vec_list = [float(x) for x in query_vector]
+        for method_name, with_scores in (
+            ("similarity_search_by_vector_with_relevance_scores", True),
+            ("similarity_search_by_vector_with_score", True),
+            ("similarity_search_by_vector", False),
+        ):
+            fn = getattr(self.store, method_name, None)
+            if not callable(fn):
+                continue
+            sig = inspect.signature(fn)
+            params = set(sig.parameters)
+            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            kwargs: dict[str, Any] = {}
+            if "k" in params or has_varkw:
+                kwargs["k"] = limit
+            if filters is not None and ("filter" in params or has_varkw):
+                kwargs["filter"] = filters
+            raw = fn(vec_list, **kwargs)
+            hits: list[AdapterHit] = []
+            for item in raw:
+                if with_scores:
+                    doc, score = item
+                    sc = float(score)
+                else:
+                    doc, sc = item, 1.0
+                meta = dict(getattr(doc, "metadata", {}) or {})
+                hits.append(
+                    AdapterHit(
+                        record_id=str(getattr(doc, "id", None) or meta.get("id") or meta.get("ember_item_id") or ""),
+                        text=str(getattr(doc, "page_content", "")),
+                        score=sc,
+                        metadata=meta,
+                    )
+                )
+            return hits[:limit]
+        return []
 
     def search(
         self,

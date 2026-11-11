@@ -183,6 +183,88 @@ def verify_flat_receipt(receipt: Mapping[str, Any], raw_doc: bytes) -> bool:
         return False
 
 
+def _redactable_leaf_spans_hashes(entry: Mapping[str, Any]) -> list[str] | None:
+    """Recompute ordered span hashes for a v2 compound leaf entry cleanly."""
+    spans = entry.get("spans")
+    if not isinstance(spans, list) or not spans:
+        return None
+    if any(forbidden in entry for forbidden in ("text", "nonce", "hash")):
+        return None
+    has_leaf_bounds = "byte_start" in entry and "byte_end" in entry
+    leaf_b_start = entry.get("byte_start", 0)
+    leaf_b_end = entry.get("byte_end", 0)
+
+    span_hashes: list[str] = []
+    for expected_sidx, span in enumerate(spans):
+        if not isinstance(span, Mapping):
+            return None
+        if "span_index" in span:
+            sidx = span["span_index"]
+            if not _is_strict_int(sidx) or sidx != expected_sidx:
+                return None
+        if "byte_start" in span or "byte_end" in span:
+            b_start = span.get("byte_start")
+            b_end = span.get("byte_end")
+            if not _is_strict_int(b_start) or not _is_strict_int(b_end) or not (0 <= b_start <= b_end):
+                return None
+            if has_leaf_bounds and not (leaf_b_start <= b_start <= b_end <= leaf_b_end):
+                return None
+        s_redacted = span.get("redacted", False)
+        if not isinstance(s_redacted, bool):
+            return None
+        if s_redacted:
+            if "text" in span or "nonce" in span:
+                return None
+            h = span.get("hash")
+            if not isinstance(h, str):
+                return None
+            try:
+                if len(bytes.fromhex(h)) != 32:
+                    return None
+            except ValueError:
+                return None
+            span_hashes.append(h)
+        else:
+            text = span.get("text")
+            nonce = span.get("nonce")
+            if not isinstance(text, str) or not isinstance(nonce, str) or not nonce:
+                return None
+            span_hashes.append(leaf_hash(text, nonce))
+    return span_hashes
+
+
+def _render_spans_text(spans: Sequence[Mapping[str, Any]], redaction_marker: str = "[redacted]") -> str:
+    """Render surviving/redacted sub-leaf spans preserving direct punctuation attachments."""
+    parts: list[str] = []
+    prev_end: int | None = None
+    prev_was_redacted = False
+    for span in spans:
+        is_redacted = bool(span.get("redacted"))
+        b_start = span.get("byte_start")
+        b_end = span.get("byte_end")
+        if is_redacted:
+            if not prev_was_redacted:
+                if parts:
+                    parts.append(" ")
+                parts.append(redaction_marker)
+            prev_was_redacted = True
+            prev_end = b_end if _is_strict_int(b_end) else None
+            continue
+
+        piece = str(span.get("text", ""))
+        if parts:
+            if _is_strict_int(b_start) and prev_end is not None and b_start <= prev_end and not prev_was_redacted:
+                pass
+            elif _is_strict_int(b_start) and prev_end is not None and b_start <= prev_end and piece and not piece[0].isalnum():
+                pass
+            else:
+                parts.append(" ")
+        parts.append(piece)
+        prev_was_redacted = False
+        prev_end = b_end if _is_strict_int(b_end) else None
+    return "".join(parts)
+
+
 def redactable_doc_hashes(doc_dict: Mapping[str, Any]) -> list[str] | None:
     """Recompute ordered leaf hashes for a serialized RedactableDoc dict cleanly."""
     if not isinstance(doc_dict, Mapping):
@@ -207,8 +289,8 @@ def redactable_doc_hashes(doc_dict: Mapping[str, Any]) -> list[str] | None:
         if not isinstance(redacted_flag, bool):
             return None
         if redacted_flag:
-            if "text" in entry or "nonce" in entry:
-                # Fail closed: a redacted entry must have stripped plaintext and nonce.
+            if "text" in entry or "nonce" in entry or "spans" in entry:
+                # Fail closed: a redacted entry must have stripped plaintext, nonce, and spans.
                 return None
             h = entry.get("hash")
             if not isinstance(h, str):
@@ -219,6 +301,11 @@ def redactable_doc_hashes(doc_dict: Mapping[str, Any]) -> list[str] | None:
             except ValueError:
                 return None
             hashes.append(h)
+        elif "spans" in entry:
+            span_hashes = _redactable_leaf_spans_hashes(entry)
+            if span_hashes is None:
+                return None
+            hashes.append(merkle_root(span_hashes))
         else:
             text = entry.get("text")
             nonce = entry.get("nonce")
@@ -246,7 +333,7 @@ def verify_redactable_doc(doc_dict: Mapping[str, Any], expected_root: str | None
 
 
 def verify_redactable_receipt(receipt: Mapping[str, Any], doc_dict: Mapping[str, Any]) -> bool:
-    """Verify a receipt against a (possibly redacted) RedactableDoc dictionary."""
+    """Verify a receipt against a (possibly redacted) RedactableDoc dictionary (v1 flat & v2 span leaves)."""
     if not isinstance(receipt, Mapping) or not isinstance(doc_dict, Mapping):
         return False
     expected_root = receipt.get("merkle_root")
@@ -278,7 +365,77 @@ def verify_redactable_receipt(receipt: Mapping[str, Any], doc_dict: Mapping[str,
     if not (0 <= leaf_index < len(entries)):
         return False
     entry = entries[leaf_index]
-    if entry.get("redacted") or "text" not in entry:
+    if entry.get("redacted"):
+        return False
+
+    if "spans" in entry:
+        spans = entry["spans"]
+        span_indices = receipt.get("span_indices")
+        span_proofs = receipt.get("span_proofs")
+        if not isinstance(span_indices, list) or not span_indices:
+            return False
+        if not all(_is_strict_int(idx) for idx in span_indices):
+            return False
+        if span_indices != list(range(span_indices[0], span_indices[0] + len(span_indices))):
+            return False
+        if not (0 <= span_indices[0] and span_indices[-1] < len(spans)):
+            return False
+        if "span_count" in receipt:
+            sc = receipt["span_count"]
+            if not _is_strict_int(sc) or sc != len(spans):
+                return False
+        if not isinstance(span_proofs, list) or len(span_proofs) != len(span_indices):
+            return False
+
+        selected_spans: list[Mapping[str, Any]] = []
+        for s_idx in span_indices:
+            sp = spans[s_idx]
+            if sp.get("redacted") or "text" not in sp or "nonce" not in sp:
+                return False
+            selected_spans.append(sp)
+
+        joined_text = _render_spans_text(selected_spans)
+        if quote != joined_text and quote not in joined_text:
+            return False
+
+        if "byte_start" in receipt or "byte_end" in receipt:
+            r_start = receipt.get("byte_start")
+            r_end = receipt.get("byte_end")
+            if not _is_strict_int(r_start) or not _is_strict_int(r_end) or not (0 <= r_start <= r_end):
+                return False
+            first_span = selected_spans[0]
+            last_span = selected_spans[-1]
+            if "byte_start" in first_span and "byte_end" in last_span:
+                if not (first_span["byte_start"] <= r_start <= r_end <= last_span["byte_end"]):
+                    return False
+
+        span_hashes = _redactable_leaf_spans_hashes(entry)
+        if span_hashes is None:
+            return False
+        leaf_digest = merkle_root(span_hashes)
+        for s_idx, s_proof in zip(span_indices, span_proofs, strict=True):
+            sp = spans[s_idx]
+            sp_digest = leaf_hash(sp["text"], sp["nonce"])
+            if not verify_inclusion(
+                sp_digest,
+                s_proof,
+                leaf_digest,
+                leaf_index=s_idx,
+                total_leaves=len(span_hashes),
+            ):
+                return False
+        return verify_inclusion(
+            leaf_digest,
+            proof,
+            expected_root,
+            leaf_index=leaf_index,
+            total_leaves=len(entries),
+        )
+
+    # Flat v1 leaf verification path
+    if "span_indices" in receipt or "span_proofs" in receipt or receipt.get("span_count", 0) not in (0, None):
+        return False
+    if "text" not in entry:
         return False
     leaf_text = entry["text"]
     if quote != leaf_text and quote not in leaf_text:

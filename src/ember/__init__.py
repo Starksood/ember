@@ -2,6 +2,7 @@
 
 from .adapters import (
     AdapterHit,
+    AdapterOp,
     InMemoryStoreAdapter,
     Mem0Adapter,
     MemoryStoreAdapter,
@@ -21,7 +22,16 @@ from .audit import (
 from .crypto import CIPHER_NAME, ERASED_TOMBSTONE, DecryptionError
 from .keystore import FileKeyStore, KeyStore, MemoryKeyStore, ShredReport
 from .ledger import IdempotencyConflict, LedgerIntegrityError, SQLiteLedger
-from .merkle import RedactableDoc, inclusion_proof, leaf_hash, merkle_root, split_parts
+from .merkle import (
+    RedactableDoc,
+    SpanChunkerFn,
+    SpanMode,
+    inclusion_proof,
+    leaf_hash,
+    merkle_root,
+    split_parts,
+    split_spans_with_offsets,
+)
 from .receipts import Receipt, locate_span, mint_flat_receipt, mint_redactable_receipt
 from .records import ClosureManifest, ErasureCertificate, LedgerEvent, MemoryItem, SourceRecord
 from .reducer import (
@@ -36,13 +46,14 @@ from .reducer import (
     decrypt_item_payload,
 )
 from .signing import AnchorReceipt, CallbackAnchor, Ed25519Signer, NullAnchor, TimestampAnchor
-from .vault import CustodyVault, QueryHit, RememberResult, SearchResult
+from .vault import CustodyVault, QueryHit, RememberResult, SearchResult, TurnTrace
 from .verify import verify_bundle, verify_ed25519_certificate, verify_ledger_chain, verify_redactable_receipt
 
 __version__ = "0.1.0"
 
 __all__ = [
     "AdapterHit",
+    "AdapterOp",
     "AnchorReceipt",
     "BenchmarkBackendSpec",
     "CIPHER_NAME",
@@ -79,9 +90,12 @@ __all__ = [
     "SearchResult",
     "ShredReport",
     "SourceRecord",
+    "SpanChunkerFn",
+    "SpanMode",
     "SubjectScenario",
     "TimestampAnchor",
     "TombstonedSubjectError",
+    "TurnTrace",
     "VectorStoreAdapter",
     "__version__",
     "apply_event",
@@ -98,6 +112,7 @@ __all__ = [
     "mint_redactable_receipt",
     "run_benchmark",
     "split_parts",
+    "split_spans_with_offsets",
     "verify_bundle",
     "verify_ed25519_certificate",
     "verify_ledger_chain",

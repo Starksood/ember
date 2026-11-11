@@ -58,6 +58,7 @@ class EmberState:
     sources: Mapping[str, SourceRecord] = field(default_factory=_frozen)
     items: Mapping[str, MemoryItem] = field(default_factory=_frozen)
     tombstoned_tokens: frozenset[str] = frozenset()
+    tombstoned_content_tokens: frozenset[str] = frozenset()
 
     @classmethod
     def empty(cls) -> "EmberState":
@@ -65,7 +66,7 @@ class EmberState:
 
     def structural_dict(self) -> dict[str, Any]:
         """Serializable representation of structural custody state (never stores plaintext keys)."""
-        return {
+        out: dict[str, Any] = {
             "version": self.version,
             "sources": {k: v.as_dict() for k, v in sorted(self.sources.items())},
             "items": {
@@ -80,6 +81,9 @@ class EmberState:
             },
             "tombstoned_tokens": sorted(self.tombstoned_tokens),
         }
+        if self.tombstoned_content_tokens:
+            out["tombstoned_content_tokens"] = sorted(self.tombstoned_content_tokens)
+        return out
 
     def digest(self) -> str:
         return sha256_prefixed(canonical_bytes(self.structural_dict()))
@@ -99,8 +103,9 @@ def compute_closure(
     *,
     subject_tokens: tuple[str, ...] = (),
     extra_source_leaves: dict[str, list[int]] | None = None,
+    extra_source_spans: dict[str, dict[int, list[int]]] | None = None,
 ) -> ClosureManifest:
-    """Compute exact closure over subjects, keyed tokens, transitive derived items, and source leaves."""
+    """Compute exact closure over subjects, keyed tokens, derived items, source leaves/spans, and adapter IDs."""
     token_set = set(subject_tokens)
     direct_ids: set[str] = set()
     for item_id, item in state.items.items():
@@ -121,9 +126,15 @@ def compute_closure(
         doomed_ids |= added
 
     leaf_redactions: dict[str, set[int]] = {}
+    span_redactions: dict[str, dict[int, set[int]]] = {}
     if extra_source_leaves:
         for sid, indices in extra_source_leaves.items():
             leaf_redactions.setdefault(sid, set()).update(indices)
+    if extra_source_spans:
+        for sid, leaf_map in extra_source_spans.items():
+            target_sid = span_redactions.setdefault(sid, {})
+            for leaf_idx, span_idxs in leaf_map.items():
+                target_sid.setdefault(int(leaf_idx), set()).update(int(si) for si in span_idxs)
 
     adapter_ids: list[str] = []
     seen_adapter: set[str] = set()
@@ -132,12 +143,26 @@ def compute_closure(
         if item.receipt_meta:
             sid = item.receipt_meta.get("source_id")
             leaf_idx = item.receipt_meta.get("leaf_index")
+            cited_spans = item.receipt_meta.get("span_indices")
             if isinstance(sid, str) and isinstance(leaf_idx, int) and leaf_idx >= 0:
-                leaf_redactions.setdefault(sid, set()).add(leaf_idx)
+                if isinstance(cited_spans, list) and cited_spans:
+                    span_redactions.setdefault(sid, {}).setdefault(leaf_idx, set()).update(
+                        int(si) for si in cited_spans
+                    )
+                else:
+                    leaf_redactions.setdefault(sid, set()).add(leaf_idx)
         for ext_id in item.adapter_record_ids:
             if ext_id not in seen_adapter:
                 seen_adapter.add(ext_id)
                 adapter_ids.append(ext_id)
+
+    # Whole-leaf redaction supersedes span-level redaction on the same (source_id, leaf_idx)
+    for sid, whole_leaves in leaf_redactions.items():
+        if sid in span_redactions:
+            for l_idx in whole_leaves:
+                span_redactions[sid].pop(l_idx, None)
+            if not span_redactions[sid]:
+                del span_redactions[sid]
 
     return ClosureManifest(
         subject_id=subject_id,
@@ -145,6 +170,10 @@ def compute_closure(
         derived_invalidated=tuple(sorted(derived_ids)),
         source_leaves_redacted={k: sorted(v) for k, v in sorted(leaf_redactions.items())},
         adapter_record_ids=tuple(adapter_ids),
+        source_spans_redacted={
+            sid: {leaf_idx: sorted(sp) for leaf_idx, sp in sorted(leaf_map.items())}
+            for sid, leaf_map in sorted(span_redactions.items())
+        },
     )
 
 
@@ -231,6 +260,7 @@ def apply_event(
             sources=_frozen(sources),
             items=state.items,
             tombstoned_tokens=state.tombstoned_tokens,
+            tombstoned_content_tokens=state.tombstoned_content_tokens,
         )
 
     if event.kind == "ADD_ITEM":
@@ -275,18 +305,21 @@ def apply_event(
             sources=state.sources,
             items=_frozen(items),
             tombstoned_tokens=state.tombstoned_tokens,
+            tombstoned_content_tokens=state.tombstoned_content_tokens,
         )
 
     if event.kind == "ERASE_SUBJECT":
         closure = event.payload["closure"]
         doomed = set(closure.get("item_ids", ()))
         tokens = {str(t) for t in event.payload.get("subject_tokens", ()) if t}
+        content_tokens = {str(t) for t in event.payload.get("content_tokens", ()) if t}
         items = {k: v for k, v in state.items.items() if k not in doomed}
         return EmberState(
             version=state.version + 1,
             sources=state.sources,
             items=_frozen(items),
             tombstoned_tokens=state.tombstoned_tokens | frozenset(tokens),
+            tombstoned_content_tokens=state.tombstoned_content_tokens | frozenset(content_tokens),
         )
 
     raise InvariantViolation(f"unhandled event kind: {event.kind!r}")
