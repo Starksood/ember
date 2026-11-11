@@ -107,6 +107,22 @@ class CustodyVault:
         self.anchor: TimestampAnchor = anchor if anchor is not None else NullAnchor()
         self.keys_separated_from_ledger = keys_separated_from_ledger
         self.state: EmberState = self.ledger.replay(self.tenant_id, keystore=self.keystore)
+        self._sync_adapter_scopes()
+
+    def _sync_adapter_scopes(self) -> None:
+        """Seed scope-aware adapters (e.g., Mem0Adapter) from replayed state after restart."""
+        register = getattr(self.adapter, "register_scope", None)
+        if not callable(register):
+            return
+        for item in self.state.items.values():
+            if item.text == ERASED_TOMBSTONE:
+                continue
+            meta = item.metadata or {}
+            uid = meta.get("user_id") or meta.get("ember_user_id") or (item.subjects[0] if item.subjects else None)
+            aid = meta.get("agent_id") or meta.get("ember_agent_id")
+            rid = meta.get("run_id") or meta.get("ember_run_id")
+            if uid is not None or aid is not None or rid is not None:
+                register(user_id=uid, agent_id=aid, run_id=rid)
 
     def __enter__(self) -> "CustodyVault":
         return self
@@ -533,9 +549,12 @@ class CustodyVault:
                 if hit.metadata.get("ember_item_id") in doomed_item_ids:
                     leaked = True
                     break
-                uid = hit.metadata.get("user_id")
-                if isinstance(uid, str) and " ".join(uid.strip().lower().split()) in target_ids_norm:
-                    leaked = True
+                for id_key in ("user_id", "ember_user_id"):
+                    uid = hit.metadata.get(id_key)
+                    if isinstance(uid, str) and " ".join(uid.strip().lower().split()) in target_ids_norm:
+                        leaked = True
+                        break
+                if leaked:
                     break
                 hit_subjects = hit.metadata.get("ember_subjects")
                 if isinstance(hit_subjects, (list, tuple)) and any(
@@ -689,6 +708,12 @@ class CustodyVault:
             merged_adapter_ids = tuple(dict.fromkeys([*prior_adapter_ids, *closure.adapter_record_ids]))
             if merged_adapter_ids:
                 self.adapter.delete(merged_adapter_ids)
+
+            # Ensure scope-aware stores (such as Mem0 2.x) probe target subject/alias scopes even on cold retry.
+            register_scope = getattr(self.adapter, "register_scope", None)
+            if callable(register_scope):
+                for target in (subject_id, *alias_list):
+                    register_scope(user_id=target)
 
             merged_item_ids = tuple(sorted(set(prior_item_ids) | set(closure.item_ids)))
             merged_derived_ids = tuple(sorted(set(prior_derived_ids) | set(closure.derived_invalidated)))

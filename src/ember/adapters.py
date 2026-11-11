@@ -6,8 +6,9 @@ Qdrant-style stores, SQLite keyword stores) without rewriting their application 
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+import hashlib
 import inspect
 from pathlib import Path
 import re
@@ -308,12 +309,43 @@ class SQLiteStoreAdapter:
                 raise
 
 
+def _normalize_mem0_entity_id(value: Any) -> str | None:
+    """Trim and sanitize Mem0 entity IDs (`user_id`, `agent_id`, `run_id`) when needed.
+
+    Mem0 2.x rejects any identifier containing whitespace (`_validate_and_trim_entity_id`).
+    IDs without internal whitespace pass through unchanged so exact names (`"priya"`,
+    `"team_acme"`) match native callers; whitespace-containing IDs (`"Kirin Press"`) map
+    deterministically to a collision-resistant slug (`"Kirin_Press__<8hex>"`).
+    """
+    if value is None:
+        return None
+    trimmed = str(value).strip()
+    if not trimmed:
+        return None
+    if not any(ch.isspace() for ch in trimmed):
+        return trimmed
+    slug = re.sub(r"\s+", "_", trimmed)
+    digest = hashlib.sha256(trimmed.encode("utf-8")).hexdigest()[:8]
+    return f"{slug}__{digest}"
+
+
+def _promote_mem0_metadata(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Combine entry `metadata` with top-level Mem0 identity fields without losing keys."""
+    meta = dict(entry.get("metadata") or {})
+    for key in ("user_id", "agent_id", "run_id", "actor_id"):
+        if key not in meta and entry.get(key) is not None:
+            meta[key] = entry[key]
+    return meta
+
+
 class Mem0Adapter:
     """Drop-in custody adapter wrapping `mem0.Memory` or `mem0.MemoryClient`.
 
     Tracks every returned Mem0 `memory_id` in Ember's structural closure so erasing a
     subject deletes direct facts, shared workspace notes, and downstream derived
-    summaries across Mem0 regardless of `user_id` bucket fragmentation.
+    summaries across Mem0 regardless of `user_id` bucket fragmentation. Also tracks
+    written Mem0 identity scopes so unscoped `search()` calls and post-erasure leak
+    probes work cleanly with Mem0 2.x's strict `filters` requirement.
     """
 
     name = "mem0"
@@ -324,12 +356,72 @@ class Mem0Adapter:
         *,
         default_user_id: str | None = None,
         default_agent_id: str | None = None,
+        default_run_id: str | None = None,
         infer: bool = False,
+        search_threshold: float | None = None,
+        known_scopes: Sequence[Mapping[str, Any]] = (),
+        sanitize_ids: bool = True,
     ) -> None:
         self.client = client
         self.default_user_id = default_user_id
         self.default_agent_id = default_agent_id
+        self.default_run_id = default_run_id
         self.infer = infer
+        self.search_threshold = search_threshold
+        self.sanitize_ids = sanitize_ids
+        self._lock = threading.RLock()
+        self._scopes: list[dict[str, str]] = []
+        self._scope_keys: set[tuple[tuple[str, str], ...]] = set()
+        if default_user_id or default_agent_id or default_run_id:
+            self.register_scope(
+                user_id=default_user_id,
+                agent_id=default_agent_id,
+                run_id=default_run_id,
+            )
+        for scope in known_scopes:
+            self.register_scope(scope)
+
+    def normalize_entity_id(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        if self.sanitize_ids:
+            return _normalize_mem0_entity_id(value)
+        trimmed = str(value).strip()
+        return trimmed or None
+
+    def register_scope(
+        self,
+        scope: Mapping[str, Any] | None = None,
+        *,
+        user_id: Any = None,
+        agent_id: Any = None,
+        run_id: Any = None,
+    ) -> None:
+        """Record a `(user_id, agent_id, run_id)` scope so unscoped searches cover it."""
+        merged: dict[str, Any] = dict(scope) if scope else {}
+        if user_id is not None:
+            merged["user_id"] = user_id
+        if agent_id is not None:
+            merged["agent_id"] = agent_id
+        if run_id is not None:
+            merged["run_id"] = run_id
+        normalized: dict[str, str] = {}
+        for key in ("user_id", "agent_id", "run_id"):
+            if key in merged and merged[key] is not None:
+                norm_val = self.normalize_entity_id(merged[key])
+                if norm_val:
+                    normalized[key] = norm_val
+        if not normalized:
+            return
+        scope_key = tuple(sorted(normalized.items()))
+        with self._lock:
+            if scope_key not in self._scope_keys:
+                self._scope_keys.add(scope_key)
+                self._scopes.append(normalized)
+
+    def registered_scopes(self) -> list[dict[str, str]]:
+        with self._lock:
+            return [dict(scope) for scope in self._scopes]
 
     def upsert(
         self,
@@ -340,16 +432,36 @@ class Mem0Adapter:
         metadata: dict[str, Any],
     ) -> tuple[str, ...]:
         meta = dict(metadata)
+        raw_user_id = meta.pop("user_id", None)
+        raw_agent_id = meta.pop("agent_id", None)
+        raw_run_id = meta.pop("run_id", None)
         meta["ember_item_id"] = item_id
         meta["ember_subjects"] = list(subjects)
 
+        eff_raw_user_id = raw_user_id if raw_user_id is not None else (
+            self.default_user_id if self.default_user_id is not None else (subjects[0] if subjects else None)
+        )
+        eff_raw_agent_id = raw_agent_id if raw_agent_id is not None else self.default_agent_id
+        eff_raw_run_id = raw_run_id if raw_run_id is not None else self.default_run_id
+
+        user_id = self.normalize_entity_id(eff_raw_user_id)
+        agent_id = self.normalize_entity_id(eff_raw_agent_id)
+        run_id = self.normalize_entity_id(eff_raw_run_id)
+
+        if eff_raw_user_id is not None and user_id != str(eff_raw_user_id).strip():
+            meta.setdefault("ember_user_id", str(eff_raw_user_id).strip())
+        if eff_raw_agent_id is not None and agent_id != str(eff_raw_agent_id).strip():
+            meta.setdefault("ember_agent_id", str(eff_raw_agent_id).strip())
+        if eff_raw_run_id is not None and run_id != str(eff_raw_run_id).strip():
+            meta.setdefault("ember_run_id", str(eff_raw_run_id).strip())
+
         kwargs: dict[str, Any] = {"metadata": meta, "infer": self.infer}
-        user_id = meta.get("user_id") or self.default_user_id or (subjects[0] if subjects else None)
-        agent_id = meta.get("agent_id") or self.default_agent_id
         if user_id is not None:
             kwargs["user_id"] = user_id
         if agent_id is not None:
             kwargs["agent_id"] = agent_id
+        if run_id is not None:
+            kwargs["run_id"] = run_id
 
         sig = inspect.signature(self.client.add)
         accepted = set(sig.parameters)
@@ -359,6 +471,8 @@ class Mem0Adapter:
             raw = self.client.add(messages=text, **filtered_kwargs)
         else:
             raw = self.client.add(text, **filtered_kwargs)
+
+        self.register_scope(user_id=user_id, agent_id=agent_id, run_id=run_id)
 
         if raw is None:
             return ()
@@ -371,28 +485,7 @@ class Mem0Adapter:
             ids.append(str(raw["id"]))
         return tuple(ids)
 
-    def search(
-        self,
-        query: str,
-        *,
-        limit: int = 5,
-        filters: dict[str, Any] | None = None,
-    ) -> list[AdapterHit]:
-        if limit <= 0:
-            return []
-        sig = inspect.signature(self.client.search)
-        params = set(sig.parameters)
-        kwargs: dict[str, Any] = {}
-        if "limit" in params:
-            kwargs["limit"] = limit
-        if filters:
-            if "filters" in params:
-                kwargs["filters"] = filters
-            else:
-                for k, v in filters.items():
-                    if k in params:
-                        kwargs[k] = v
-        raw = self.client.search(query, **kwargs)
+    def _rows_to_hits(self, raw: Any) -> list[AdapterHit]:
         if raw is None:
             return []
         rows = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
@@ -405,26 +498,121 @@ class Mem0Adapter:
                     record_id=str(entry.get("id", "")),
                     text=str(entry.get("memory") or entry.get("text") or entry.get("content") or ""),
                     score=float(entry.get("score", 0.0) or 0.0),
-                    metadata=dict(entry.get("metadata") or {}),
+                    metadata=_promote_mem0_metadata(entry),
                 )
             )
+        return hits
+
+    def _normalize_filters(self, filters: Mapping[str, Any] | None) -> dict[str, Any]:
+        if not filters:
+            return {}
+        out = dict(filters)
+        if self.sanitize_ids:
+            for key in ("user_id", "agent_id", "run_id"):
+                if key in out and isinstance(out[key], str):
+                    norm_val = self.normalize_entity_id(out[key])
+                    if norm_val is not None:
+                        out[key] = norm_val
+        return out
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        sig = inspect.signature(self.client.search)
+        params = set(sig.parameters)
+        base_kwargs: dict[str, Any] = {}
+        if "top_k" in params:
+            base_kwargs["top_k"] = limit
+        elif "limit" in params:
+            base_kwargs["limit"] = limit
+        if self.search_threshold is not None and "threshold" in params:
+            base_kwargs["threshold"] = self.search_threshold
+
+        norm_filters = self._normalize_filters(filters)
+        has_identity_filter = any(
+            norm_filters.get(k) is not None for k in ("user_id", "agent_id", "run_id")
+        )
+
+        # Single direct search when explicit identity filters are supplied or client doesn't take `filters`.
+        if has_identity_filter or "filters" not in params:
+            kwargs = dict(base_kwargs)
+            if norm_filters:
+                if "filters" in params:
+                    kwargs["filters"] = norm_filters
+                else:
+                    for k, v in norm_filters.items():
+                        if k in params:
+                            kwargs[k] = v
+            raw = self.client.search(query, **kwargs)
+            return self._rows_to_hits(raw)[:limit]
+
+        # Unscoped search against a `filters`-aware client (e.g., mem0.Memory 2.x):
+        # fan out across tracked identity scopes so Mem0 never rejects `filters=None`.
+        scopes = self.registered_scopes()
+        query_scopes: list[dict[str, Any]]
+        if scopes:
+            norm_default_agent = self.normalize_entity_id(self.default_agent_id)
+            if (
+                norm_default_agent
+                and "agent_id" not in norm_filters
+                and all(s.get("agent_id") == norm_default_agent for s in scopes)
+            ):
+                query_scopes = [{"agent_id": norm_default_agent, **norm_filters}]
+            else:
+                query_scopes = [{**scope, **norm_filters} for scope in scopes]
+        else:
+            kwargs = dict(base_kwargs)
+            if norm_filters:
+                kwargs["filters"] = norm_filters
+            try:
+                raw = self.client.search(query, **kwargs)
+                return self._rows_to_hits(raw)[:limit]
+            except ValueError as exc:
+                if "filters must contain at least one of" in str(exc):
+                    return []
+                raise
+
+        merged: dict[str, AdapterHit] = {}
+        for idx, qf in enumerate(query_scopes):
+            raw = self.client.search(query, filters=qf, **base_kwargs)
+            for hit in self._rows_to_hits(raw):
+                dedup_key = hit.record_id or f"anon:{idx}:{hit.text}"
+                prev = merged.get(dedup_key)
+                if prev is None or hit.score > prev.score:
+                    merged[dedup_key] = hit
+        hits = list(merged.values())
+        hits.sort(key=lambda h: (-h.score, h.record_id))
         return hits[:limit]
 
     def delete(self, record_ids: Sequence[str]) -> int:
         deleted = 0
-        for rid in record_ids:
-            if not rid:
-                continue
+        ids = list(dict.fromkeys(str(rid) for rid in record_ids if rid))
+        if not ids:
+            return 0
+        sig = inspect.signature(self.client.delete)
+        use_kw = "memory_id" in sig.parameters
+        for rid in ids:
             try:
-                sig = inspect.signature(self.client.delete)
-                if "memory_id" in sig.parameters:
-                    self.client.delete(memory_id=rid)
-                else:
+                try:
+                    if use_kw:
+                        self.client.delete(memory_id=rid)
+                    else:
+                        self.client.delete(rid)
+                except TypeError:
                     self.client.delete(rid)
                 deleted += 1
-            except TypeError:
-                self.client.delete(rid)
-                deleted += 1
+            except ValueError as exc:
+                # Retry-safe idempotency: Mem0 2.x raises ValueError("Memory with id ... not found")
+                # if an earlier interrupted delete pass already removed the record from the vector store.
+                if "not found" in str(exc).lower():
+                    continue
+                raise
         return deleted
 
 

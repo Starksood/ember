@@ -8,7 +8,16 @@ from .adapters import (
     SQLiteStoreAdapter,
     VectorStoreAdapter,
 )
-from .audit import SUITE_V2, SubjectScenario, run_benchmark, verify_suite_hygiene
+from .audit import (
+    SUITE_V2,
+    BenchmarkBackendSpec,
+    ScenarioBackendPair,
+    SubjectScenario,
+    in_memory_backend_spec,
+    mem0_backend_spec,
+    run_benchmark,
+    verify_suite_hygiene,
+)
 from .crypto import CIPHER_NAME, ERASED_TOMBSTONE, DecryptionError
 from .keystore import FileKeyStore, KeyStore, MemoryKeyStore, ShredReport
 from .ledger import IdempotencyConflict, LedgerIntegrityError, SQLiteLedger
@@ -35,6 +44,7 @@ __version__ = "0.1.0"
 __all__ = [
     "AdapterHit",
     "AnchorReceipt",
+    "BenchmarkBackendSpec",
     "CIPHER_NAME",
     "CallbackAnchor",
     "ClosureManifest",
@@ -65,6 +75,7 @@ __all__ = [
     "SQLiteLedger",
     "SQLiteStoreAdapter",
     "SUITE_V2",
+    "ScenarioBackendPair",
     "SearchResult",
     "ShredReport",
     "SourceRecord",
@@ -77,9 +88,11 @@ __all__ = [
     "compute_closure",
     "decrypt_item_metadata",
     "decrypt_item_payload",
+    "in_memory_backend_spec",
     "inclusion_proof",
     "leaf_hash",
     "locate_span",
+    "mem0_backend_spec",
     "merkle_root",
     "mint_flat_receipt",
     "mint_redactable_receipt",

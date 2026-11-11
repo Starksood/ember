@@ -2,6 +2,20 @@
 
 All notable changes to `ember-custody` are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **`Mem0Adapter` compatibility with live `mem0ai` 2.x (`ember.adapters`, `ember.vault`):**
+  - Track written `(user_id, agent_id, run_id)` scopes (plus persistence/restoration across restarts via `CustodyVault._sync_adapter_scopes()`) and fan out unscoped `search(filters=None)` queries so Mem0 2.x's required identity filter check never crashes `_probe_raw_leaks()` or `vault.search()`. Optimized uniform `default_agent_id` scopes to query in a single pass.
+  - Map `limit` to Mem0 2.x `top_k` (falling back to `limit` for v1/`MemoryClient`), forward optional `search_threshold`, strip identity keys from outgoing `metadata` payloads to prevent `ignoring metadata['user_id']` warnings, promote top-level `user_id`/`agent_id`/`run_id`/`actor_id` back into `AdapterHit.metadata`, deterministically sanitize whitespace in entity IDs (e.g., `"Kirin Press"`), and treat missing-ID `ValueError` during `delete()` retries idempotently.
+
+### Added & Changed
+- **Pluggable, self-documenting benchmark reporting (`ember.audit`, `ember.cli`):**
+  - Added `BenchmarkBackendSpec`, `ScenarioBackendPair`, `in_memory_backend_spec()`, and `mem0_backend_spec()` so `SUITE_V2` runs identically with all bystander-survival, redacted Merkle receipt, content-free replay, tombstone, and Ed25519 gates against either `InMemoryStoreAdapter` or a real `Mem0` vector backend.
+  - `run_subject_scenario()`, `run_benchmark()`, and `ember benchmark` now explicitly record and print the evaluated `Adapter`, `Retrieval`, `Embedding`, and `Search` settings alongside scores.
+  - Added [`examples/benchmark_mem0.py`](examples/benchmark_mem0.py) and verified `SUITE_V2` locally against `mem0ai==2.2.1` + `Qdrant` + `sentence-transformers/all-MiniLM-L6-v2`.
+  - Documented Mem0's internal plaintext `history.db` (`history_db_path`) boundary in [`SECURITY.md`](SECURITY.md), [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md), [`docs/TRILEMMA.md`](docs/TRILEMMA.md), and [`README.md`](README.md).
+
 ## [0.1.0] — Initial Public Release
 
 ### Added

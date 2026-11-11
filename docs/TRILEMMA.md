@@ -57,9 +57,9 @@ node_hash  = SHA-256(0x01 || left_32 || right_32)
 ### C. Keyed Tombstones & Two-Direction Calibration ([`reducer.py`](../src/ember/reducer.py), [`audit.py`](../src/ember/audit.py))
 - Vault-keyed HMAC-SHA256 tombstones block zombie re-ingestion with `TombstonedSubjectError` unless an explicit `reconsent_id` is recorded.
 - `erase()` probes the **raw backing store directly** (`adapter.search()`) and refuses to issue an Ed25519 `ErasureCertificate` (`ErasureIncomplete`) if any residue still surfaces.
-- The built-in adversarial suite tests **12 subjects × 7 attack categories (204 probes)** while co-gating **bystander retrieval survival** and **redacted Merkle receipt verification**:
-  - Naive `user_id`-only baseline: **204/204 probes leak**
-  - Ember wrapper: **0/204 probes leak**, **100% bystander memories survive**, **100% bystander receipts verify offline**, **100% from-zero replays stay content-free**.
+- The built-in adversarial suite (`SUITE_V2`) tests **12 subjects × 7 attack categories (204 probes)** while co-gating **bystander retrieval survival** and **redacted Merkle receipt verification**, and reports the evaluated adapter, retrieval mode, embedding model, and search settings next to the scores (`ember benchmark` and `ember benchmark --json`):
+  - **Deterministic lexical fixture (`InMemoryStoreAdapter`, `retrieval=keyword_overlap`, `embedding=none`, `probe_limit=10`, `bystander_limit=5`):** naive baseline leaks **204/204**; Ember leaks **0/204**, **100% bystanders survive**, **100% receipts verify**, **100% from-zero replays content-free**.
+  - **Real configured vector backend (`Mem0Adapter` over `mem0ai==2.2.1` + local `Qdrant`, `sentence-transformers/all-MiniLM-L6-v2` 384-dim cosine, `top_k=10`, `bystander_limit=5`, `infer=False`, tested at both `threshold=0.1` and `threshold=0.0`, see [`examples/benchmark_mem0.py`](../examples/benchmark_mem0.py)):** naive `mem0.delete_all(user_id=subject)` leaks **204/204**; Ember leaks **0/204** with **100% bystander survival**, **100% bystander receipts valid**, and **100% content-free replays**.
 
 ---
 
@@ -69,3 +69,4 @@ Cryptography cannot erase data you already leaked out-of-band. Every certificate
 1. **Separate your keys from ledger backups:** Crypto-shredding only protects pre-existing snapshots if `key_dir` (or your KMS/HSM `KeyStore`) was never backed up alongside `ledger.db`.
 2. **External timestamp anchoring:** Without configuring a `TimestampAnchor` (RFC 3161 TSA or public transparency log), a malicious root operator holding both `ledger.db` and `ed25519.json` can rewrite history coherently. Unanchored certificates explicitly declare `externally_timestamped: false`.
 3. **Unlinked copy-paste residue:** Structural lineage catches everything written via `subjects` and `derived_from` plus optional `leaf_predicate` sweeps; unlinked copies still trigger fail-closed rejection via `probes`.
+4. **Mem0's internal `history.db` log:** Deleting a record via `mem0.Memory.delete(memory_id)` purges live Qdrant vector search and entity links, but Mem0's internal SQLite history database (`history_db_path`) retains `old_memory` in plaintext on `"DELETE"` events. Isolate, encrypt, or prune `history_db_path` if that log sits in your threat model.

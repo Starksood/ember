@@ -11,14 +11,144 @@ Encodes the Phase 0 lessons learned from Fireweed:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass, field
 import json
-from dataclasses import dataclass
 from typing import Any
 
-from .adapters import InMemoryStoreAdapter
+from .adapters import InMemoryStoreAdapter, Mem0Adapter, MemoryStoreAdapter
 from .reducer import TombstonedSubjectError, decrypt_item_metadata, decrypt_item_payload
 from .vault import CustodyVault
 from .verify import verify_ed25519_certificate
+
+
+@dataclass(frozen=True)
+class ScenarioBackendPair:
+    """Baseline and Ember adapter pair provisioned for one scenario run."""
+
+    baseline: MemoryStoreAdapter
+    baseline_delete_naive: Callable[[str], Any]
+    ember_adapter: MemoryStoreAdapter
+    close: Callable[[], None] | None = None
+
+
+@dataclass(frozen=True)
+class BenchmarkBackendSpec:
+    """Adapter and search configuration evaluated by the adversarial erasure suite."""
+
+    adapter_name: str
+    retrieval_mode: str
+    embedding_model: str | None = None
+    vector_store: str | None = None
+    search_settings: dict[str, Any] = field(default_factory=dict)
+    pair_factory: Callable[["SubjectScenario"], ScenarioBackendPair] | None = None
+
+    def metadata_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.adapter_name,
+            "retrieval_mode": self.retrieval_mode,
+            "embedding_model": self.embedding_model,
+            "vector_store": self.vector_store,
+            "search_settings": dict(self.search_settings),
+        }
+
+
+def in_memory_backend_spec() -> BenchmarkBackendSpec:
+    """Default deterministic lexical-overlap fixture (`InMemoryStoreAdapter`)."""
+
+    def _make_pair(_scenario: "SubjectScenario") -> ScenarioBackendPair:
+        baseline = InMemoryStoreAdapter()
+        ember_adapter = InMemoryStoreAdapter()
+        return ScenarioBackendPair(
+            baseline=baseline,
+            baseline_delete_naive=baseline.delete_by_user_id_naive,
+            ember_adapter=ember_adapter,
+        )
+
+    return BenchmarkBackendSpec(
+        adapter_name="InMemoryStoreAdapter",
+        retrieval_mode="keyword_overlap",
+        embedding_model=None,
+        vector_store=None,
+        search_settings={
+            "probe_limit": 10,
+            "bystander_limit": 5,
+            "erase_probe_limit": 25,
+            "naive_delete": "user_id_metadata_exact",
+        },
+        pair_factory=_make_pair,
+    )
+
+
+def mem0_backend_spec(
+    memory_factory: Callable[["SubjectScenario", str], Any],
+    *,
+    embedding_model: str,
+    vector_store: str = "qdrant",
+    retrieval_mode: str = "vector_semantic",
+    probe_limit: int = 10,
+    bystander_limit: int = 5,
+    threshold: float | None = 0.0,
+    infer: bool = False,
+    extra_search_settings: dict[str, Any] | None = None,
+) -> BenchmarkBackendSpec:
+    """Build a `BenchmarkBackendSpec` backed by real `mem0.Memory` instances."""
+
+    def _make_pair(scenario: "SubjectScenario") -> ScenarioBackendPair:
+        baseline_mem = memory_factory(scenario, "baseline")
+        try:
+            ember_mem = memory_factory(scenario, "ember")
+        except BaseException:
+            if hasattr(baseline_mem, "close"):
+                baseline_mem.close()
+            raise
+        baseline_adapter = Mem0Adapter(
+            baseline_mem,
+            infer=infer,
+            search_threshold=threshold,
+        )
+        ember_adapter = Mem0Adapter(
+            ember_mem,
+            infer=infer,
+            search_threshold=threshold,
+        )
+
+        def _delete_naive(subject_id: str) -> Any:
+            norm_id = baseline_adapter.normalize_entity_id(subject_id) or subject_id
+            return baseline_mem.delete_all(user_id=norm_id)
+
+        def _close() -> None:
+            for client in (baseline_mem, ember_mem):
+                close_fn = getattr(client, "close", None)
+                if callable(close_fn):
+                    close_fn()
+
+        return ScenarioBackendPair(
+            baseline=baseline_adapter,
+            baseline_delete_naive=_delete_naive,
+            ember_adapter=ember_adapter,
+            close=_close,
+        )
+
+    settings: dict[str, Any] = {
+        "probe_limit": probe_limit,
+        "bystander_limit": bystander_limit,
+        "erase_probe_limit": 25,
+        "threshold": threshold,
+        "infer": infer,
+        "naive_delete": "mem0.delete_all(user_id=subject)",
+    }
+    if extra_search_settings:
+        settings.update(extra_search_settings)
+
+    return BenchmarkBackendSpec(
+        adapter_name="Mem0Adapter",
+        retrieval_mode=retrieval_mode,
+        embedding_model=embedding_model,
+        vector_store=vector_store,
+        search_settings=settings,
+        pair_factory=_make_pair,
+    )
 
 
 @dataclass(frozen=True)
@@ -163,34 +293,62 @@ def _contains_marker(text: str, markers: tuple[str, ...]) -> bool:
     return any(m.lower() in low for m in markers)
 
 
-def run_subject_scenario(scenario: SubjectScenario) -> dict[str, Any]:
+def run_subject_scenario(
+    scenario: SubjectScenario,
+    *,
+    backend: BenchmarkBackendSpec | None = None,
+) -> dict[str, Any]:
     """Run baseline naive deletion vs Ember custody wrapper on one subject scenario."""
-    # 1. Baseline naive vector/KV store (`delete_all(user_id=subject)` only)
-    baseline = InMemoryStoreAdapter()
-    for i, fact in enumerate(scenario.facts):
-        baseline.upsert(item_id=f"b_s_{i}", text=fact, subjects=(scenario.subject,), metadata={"user_id": scenario.subject})
-    for i, bfact in enumerate(scenario.bystander_facts):
-        owner = scenario.peer if i == 0 else scenario.third
-        baseline.upsert(item_id=f"b_b_{i}", text=bfact, subjects=(owner,), metadata={"user_id": owner})
-    baseline.upsert(
-        item_id="b_derived",
-        text=scenario.derived_summary,
-        subjects=(scenario.org,),
-        metadata={"user_id": scenario.org},
-    )
-    baseline.delete_by_user_id_naive(scenario.subject)
+    resolved_backend = backend if backend is not None else in_memory_backend_spec()
+    adapter_meta = resolved_backend.metadata_dict()
+    probe_limit = int(resolved_backend.search_settings.get("probe_limit", 10))
+    bystander_limit = int(resolved_backend.search_settings.get("bystander_limit", 5))
 
-    baseline_leaks = 0
-    for probes in scenario.attacks.values():
-        for probe in probes:
-            hits = baseline.search(probe, limit=10)
-            if any(_contains_marker(h.text, scenario.leak_markers) for h in hits):
-                baseline_leaks += 1
+    if resolved_backend.pair_factory is not None:
+        pair = resolved_backend.pair_factory(scenario)
+    else:
+        default_spec = in_memory_backend_spec()
+        if default_spec.pair_factory is None:
+            raise RuntimeError("in_memory_backend_spec missing pair_factory")
+        pair = default_spec.pair_factory(scenario)
 
-    # 2. Ember-wrapped store with shared RedactableDoc + derived lineage + crypto-shredding
-    adapter = InMemoryStoreAdapter()
-    vault = CustodyVault.ephemeral(adapter=adapter)
+    vault: CustodyVault | None = None
     try:
+        # 1. Baseline naive vector/KV store (`delete_all(user_id=subject)` only)
+        baseline = pair.baseline
+        for i, fact in enumerate(scenario.facts):
+            baseline.upsert(
+                item_id=f"b_s_{i}",
+                text=fact,
+                subjects=(scenario.subject,),
+                metadata={"user_id": scenario.subject},
+            )
+        for i, bfact in enumerate(scenario.bystander_facts):
+            owner = scenario.peer if i == 0 else scenario.third
+            baseline.upsert(
+                item_id=f"b_b_{i}",
+                text=bfact,
+                subjects=(owner,),
+                metadata={"user_id": owner},
+            )
+        baseline.upsert(
+            item_id="b_derived",
+            text=scenario.derived_summary,
+            subjects=(scenario.org,),
+            metadata={"user_id": scenario.org},
+        )
+        pair.baseline_delete_naive(scenario.subject)
+
+        baseline_leaks = 0
+        for probes in scenario.attacks.values():
+            for probe in probes:
+                hits = baseline.search(probe, limit=probe_limit)
+                if any(_contains_marker(h.text, scenario.leak_markers) for h in hits):
+                    baseline_leaks += 1
+
+        # 2. Ember-wrapped store with shared RedactableDoc + derived lineage + crypto-shredding
+        adapter = pair.ember_adapter
+        vault = CustodyVault.ephemeral(adapter=adapter)
         shared_text = " ".join([*scenario.facts, *scenario.bystander_facts])
         vault.register_source("shared_intake", shared_text, origin="audit_suite", origin_kind="file")
 
@@ -228,8 +386,8 @@ def run_subject_scenario(scenario: SubjectScenario) -> dict[str, Any]:
             cat_leaks = 0
             for probe in probes:
                 total_probes += 1
-                res = vault.search(probe, limit=10)
-                raw_hits = adapter.search(probe, limit=10)
+                res = vault.search(probe, limit=probe_limit)
+                raw_hits = adapter.search(probe, limit=probe_limit)
                 if any(_contains_marker(h.text, scenario.leak_markers) for h in res.hits) or any(
                     _contains_marker(h.text, scenario.leak_markers) for h in raw_hits
                 ):
@@ -239,7 +397,7 @@ def run_subject_scenario(scenario: SubjectScenario) -> dict[str, Any]:
 
         # Check bystander survival (anti-over-deletion gate!)
         bystander_retrievable = all(
-            not vault.search(bq, limit=5).abstained for bq in scenario.bystander_queries
+            not vault.search(bq, limit=bystander_limit).abstained for bq in scenario.bystander_queries
         )
 
         # Check surviving bystander receipts verify against redacted RedactableDoc
@@ -269,6 +427,7 @@ def run_subject_scenario(scenario: SubjectScenario) -> dict[str, Any]:
 
         return {
             "subject": scenario.subject,
+            "adapter": adapter_meta,
             "total_probes": total_probes,
             "baseline_naive_leaks": baseline_leaks,
             "ember_leaks": ember_leaks,
@@ -282,13 +441,21 @@ def run_subject_scenario(scenario: SubjectScenario) -> dict[str, Any]:
             "derived_invalidated": len(cert.closure["derived_invalidated"]),
         }
     finally:
-        vault.close()
+        if vault is not None:
+            vault.close()
+        if pair.close is not None:
+            pair.close()
 
 
-def run_benchmark(suite: tuple[SubjectScenario, ...] = SUITE_V2) -> dict[str, Any]:
+def run_benchmark(
+    suite: tuple[SubjectScenario, ...] = SUITE_V2,
+    *,
+    backend: BenchmarkBackendSpec | None = None,
+) -> dict[str, Any]:
     """Execute the full adversarial suite with enforced hygiene and aggregate scorecard."""
+    resolved_backend = backend if backend is not None else in_memory_backend_spec()
     hygiene = verify_suite_hygiene(suite)
-    rows = [run_subject_scenario(s) for s in suite]
+    rows = [run_subject_scenario(s, backend=resolved_backend) for s in suite]
     total_probes = sum(r["total_probes"] for r in rows)
     total_ember_leaks = sum(r["ember_leaks"] for r in rows)
     total_baseline_leaks = sum(r["baseline_naive_leaks"] for r in rows)
@@ -303,6 +470,7 @@ def run_benchmark(suite: tuple[SubjectScenario, ...] = SUITE_V2) -> dict[str, An
     )
     return {
         "suite": "ember_erasure_v2",
+        "adapter": resolved_backend.metadata_dict(),
         "hygiene": hygiene,
         "subjects": len(rows),
         "total_probes": total_probes,

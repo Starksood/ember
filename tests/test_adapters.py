@@ -198,3 +198,181 @@ def test_vector_store_and_sqlite_adapters(tmp_path):
     assert not v2.search("biostatistics").abstained
     v2.close()
     sql_adapter.close()
+
+
+class StrictMem0V2Mock:
+    """Enforces Mem0 2.x exact runtime contract discovered against mem0ai==2.2.1."""
+
+    def __init__(self, *, fail_once_on_delete: bool = False) -> None:
+        self.rows: dict[str, dict[str, Any]] = {}
+        self.warnings: list[str] = []
+        self.search_calls: list[dict[str, Any]] = []
+        self.fail_once_on_delete = fail_once_on_delete
+        self.delete_attempts = 0
+
+    def add(
+        self,
+        messages,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        infer: bool = True,
+    ) -> dict[str, Any]:
+        meta = dict(metadata or {})
+        for key in ("user_id", "agent_id", "run_id"):
+            if key in meta:
+                self.warnings.append(f"add(): ignoring metadata[{key!r}]")
+                meta.pop(key, None)
+        for name, val in (("user_id", user_id), ("agent_id", agent_id), ("run_id", run_id)):
+            if val is not None:
+                if not str(val).strip() or any(ch.isspace() for ch in str(val).strip()):
+                    raise ValueError(f"Invalid {name}: cannot contain whitespace.")
+        if not any((user_id, agent_id, run_id)):
+            raise ValueError("At least one of user_id, agent_id, or run_id must be provided.")
+        mid = f"m2_{uuid.uuid4().hex[:10]}"
+        self.rows[mid] = {
+            "id": mid,
+            "memory": str(messages),
+            "user_id": user_id,
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "metadata": meta,
+            "infer": infer,
+        }
+        return {"results": [{"id": mid, "memory": str(messages), "event": "ADD"}]}
+
+    def search(
+        self,
+        query: str,
+        *,
+        top_k: int = 20,
+        filters: dict[str, Any] | None = None,
+        threshold: float = 0.1,
+        **kwargs,
+    ) -> dict[str, Any]:
+        if any(k in kwargs for k in ("user_id", "agent_id", "run_id")):
+            raise ValueError("Top-level entity params rejected in search(); use filters.")
+        if not filters or not any(k in filters for k in ("user_id", "agent_id", "run_id")):
+            raise ValueError("filters must contain at least one of: user_id, agent_id, run_id.")
+        self.search_calls.append({"query": query, "top_k": top_k, "filters": dict(filters), "threshold": threshold})
+
+        q_tokens = {tok.strip(".,?!") for tok in query.lower().split() if tok.strip(".,?!")}
+        results = []
+        for row in self.rows.values():
+            if "user_id" in filters and row.get("user_id") != filters["user_id"]:
+                continue
+            if "agent_id" in filters and row.get("agent_id") != filters["agent_id"]:
+                continue
+            if "run_id" in filters and row.get("run_id") != filters["run_id"]:
+                continue
+            words = {tok.strip(".,?!") for tok in row["memory"].lower().split() if tok.strip(".,?!")}
+            overlap = len(q_tokens & words)
+            score = overlap / max(1, len(q_tokens))
+            if score >= threshold:
+                # Mirror real Mem0 2.x output shape: top-level user_id, metadata separate
+                results.append(
+                    {
+                        "id": row["id"],
+                        "memory": row["memory"],
+                        "score": score,
+                        "user_id": row["user_id"],
+                        **({"agent_id": row["agent_id"]} if row.get("agent_id") else {}),
+                        **({"run_id": row["run_id"]} if row.get("run_id") else {}),
+                        "metadata": dict(row["metadata"]),
+                    }
+                )
+        results.sort(key=lambda r: -r["score"])
+        return {"results": results[:top_k]}
+
+    def delete(self, memory_id: str) -> dict[str, str]:
+        self.delete_attempts += 1
+        if memory_id not in self.rows:
+            raise ValueError(f"Memory with id {memory_id} not found")
+        del self.rows[memory_id]
+        if self.fail_once_on_delete:
+            self.fail_once_on_delete = False
+            raise ConnectionError("simulated mid-batch Mem0 timeout after deleting one ID")
+        return {"message": "Memory deleted successfully!"}
+
+    def delete_all(self, user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None) -> None:
+        doomed = [
+            mid
+            for mid, row in self.rows.items()
+            if (user_id is None or row.get("user_id") == user_id)
+            and (agent_id is None or row.get("agent_id") == agent_id)
+            and (run_id is None or row.get("run_id") == run_id)
+        ]
+        for mid in doomed:
+            del self.rows[mid]
+
+
+def test_mem0_v2_strict_scopes_whitespace_restart_and_idempotent_retry(tmp_path):
+    strict = StrictMem0V2Mock(fail_once_on_delete=True)
+    vault_dir = tmp_path / "vault"
+    key_dir = tmp_path / "keys"
+
+    adapter1 = Mem0Adapter(strict, search_threshold=0.0)
+    v1 = CustodyVault.open(vault_dir, key_dir=key_dir, adapter=adapter1)
+    v1.register_source("intake", "Yuki translates novels in Sapporo. Marco edits poetry at Kirin Press.")
+    r_yuki = v1.remember(
+        "Yuki is a translator in Sapporo.",
+        subjects=["Yuki"],
+        source_id="intake",
+        quote="Yuki translates novels in Sapporo.",
+        metadata={"user_id": "Yuki"},
+    )
+    r_marco = v1.remember(
+        "Marco is an editor at Kirin Press.",
+        subjects=["Marco"],
+        source_id="intake",
+        quote="Marco edits poetry at Kirin Press.",
+        metadata={"user_id": "Marco"},
+    )
+    # Whitespace org name (`Kirin Press`) previously triggered ValueError in real Mem0 2.x!
+    v1.remember(
+        "Staff summary at Kirin Press: Yuki in Sapporo collaborates with Marco.",
+        subjects=["Kirin Press"],
+        derived_from=[r_yuki.item.item_id, r_marco.item.item_id],
+        metadata={"user_id": "Kirin Press"},
+    )
+
+    assert strict.warnings == []
+
+    # First erase deletes Yuki's ID, then raises simulated timeout on the derived ID
+    with pytest.raises(ConnectionError):
+        v1.erase("Yuki", probes=["Where does Yuki work?"])
+    v1.close()
+
+    # Reopen on fresh Mem0Adapter after restart: scopes restore from state, retry deletes remaining ID,
+    # and already-deleted Yuki ID raises "Memory with id ... not found" which Mem0Adapter handles idempotently!
+    adapter2 = Mem0Adapter(strict, search_threshold=0.0)
+    v2 = CustodyVault.open(vault_dir, key_dir=key_dir, adapter=adapter2)
+    cert = v2.erase("Yuki", probes=["Where does Yuki work?", "translator Sapporo"])
+    assert len(cert.closure["adapter_record_ids"]) == 2
+    assert len(strict.rows) == 1
+    # Ensure top_k and threshold=0.0 reached Mem0 search() rather than falling back to limit/0.1
+    assert any(c["top_k"] == 25 and c["threshold"] == 0.0 for c in strict.search_calls)
+
+    marco_res = v2.search("Marco edits poetry", limit=5)
+    assert not marco_res.abstained
+    assert marco_res.hits[0].metadata.get("user_id") == "Marco"
+    assert v2.verify_item_receipt(r_marco.item.item_id) is True
+    v2.close()
+
+
+def test_mem0_adapter_default_agent_id_queries_in_single_scope_when_uniform():
+    strict = StrictMem0V2Mock()
+    adapter = Mem0Adapter(strict, default_agent_id="shared_agent", search_threshold=0.1)
+    v = CustodyVault.ephemeral(adapter=adapter)
+    v.remember("Priya works in Portland.", subjects=["priya"])
+    v.remember("Dana works in Seattle.", subjects=["dana"])
+    strict.search_calls.clear()
+
+    res = v.search("Seattle", limit=5)
+    assert not res.abstained and len(res.hits) == 1
+    assert res.hits[0].text == "Dana works in Seattle."
+    assert len(strict.search_calls) == 1
+    assert strict.search_calls[0]["filters"] == {"agent_id": "shared_agent"}
+    v.close()

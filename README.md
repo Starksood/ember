@@ -139,7 +139,7 @@ python3 verify.py bundle.json
 
 ## Adversarial Benchmark & Two-Direction Calibration
 
-Run the built-in 12-subject × 7-attack-class benchmark (`direct`, `paraphrase`, `inference`, `multi_hop`, `attribute`, `temporal`, `aggregate` — 204 attack probes total):
+Run the deterministic keyword-overlap fixture (`InMemoryStoreAdapter`) across 12 subjects × 7 attack classes (`direct`, `paraphrase`, `inference`, `multi_hop`, `attribute`, `temporal`, `aggregate` — 204 attack probes total):
 
 ```bash
 ember benchmark
@@ -149,10 +149,14 @@ Measured output comparing a naive `delete_all(user_id=subject)` baseline (where 
 
 ```text
 EMBER ERASURE ADVERSARIAL SUITE — 12 subjects, 204 probes (7 attack classes)
+  Adapter   : InMemoryStoreAdapter (retrieval=keyword_overlap, store=in-process)
+  Embedding : none
+  Search    : bystander_limit=5, erase_probe_limit=25, naive_delete=user_id_metadata_exact, probe_limit=10
 ==============================================================================
   Priya      baseline_leaks=17  ember_leaks= 0  derived=1  bystander_ok=True  receipt_ok=True  replay_clean=True
   ... (12 subjects total)
 ==============================================================================
+  Adapter              : InMemoryStoreAdapter (keyword_overlap, embed=none)
   Baseline naive leaks : 204/204
   Ember leaks          : 0/204
   Bystanders survived  : True
@@ -161,7 +165,33 @@ EMBER ERASURE ADVERSARIAL SUITE — 12 subjects, 204 probes (7 attack classes)
   Ed25519 certs valid  : True
 ```
 
-Why bystander checks are co-primary: leak rate alone is monotone in deletion — deleting *everything* scores `0/204` leaks. Both `tests/test_erasure_suite.py` and `tests/test_calibration.py` verify both failure directions: under-deletion triggers `ErasureIncomplete`, and over-deletion fails bystander retrieval survival.
+### Real Vector-Store Comparison (`Mem0` + Qdrant + Dense Embeddings)
+
+`run_benchmark()` accepts any `BenchmarkBackendSpec` (`mem0_backend_spec`) so the exact same 204-probe corpus, bystander survival checks, redacted Merkle receipt checks, content-free replay verification, and Ed25519 certificate verification can run against a live vector store:
+
+```bash
+pip install "ember-custody[mem0]" qdrant-client sentence-transformers
+python examples/benchmark_mem0.py --threshold 0.0
+```
+
+Verified locally against `mem0ai==2.2.1` + local `Qdrant` + `sentence-transformers/all-MiniLM-L6-v2` (384-dim cosine similarity, `top_k=10`, `bystander_limit=5`, `infer=False`, tested at both `threshold=0.1` and `threshold=0.0`):
+
+```text
+EMBER ERASURE ADVERSARIAL SUITE — 12 subjects, 204 probes (7 attack classes)
+  Adapter   : Mem0Adapter (retrieval=vector_semantic_cosine, store=qdrant (local))
+  Embedding : sentence-transformers/all-MiniLM-L6-v2
+  Search    : bystander_limit=5, embedding_dims=384, erase_probe_limit=25, infer=False, naive_delete=mem0.delete_all(user_id=subject), probe_limit=10, threshold=0.0
+==============================================================================
+  Adapter              : Mem0Adapter (vector_semantic_cosine, embed=sentence-transformers/all-MiniLM-L6-v2)
+  Baseline naive leaks : 204/204
+  Ember leaks          : 0/204
+  Bystanders survived  : True
+  Receipts intact      : True
+  Replays content-free : True
+  Ed25519 certs valid  : True
+```
+
+Why bystander checks are co-primary: leak rate alone is monotone in deletion — deleting *everything* scores `0/204` leaks. Both `tests/test_erasure_suite.py` and `tests/test_calibration.py` verify both failure directions: under-deletion triggers `ErasureIncomplete`, and over-deletion fails bystander retrieval survival (checked against both `InMemoryStoreAdapter` and live `Mem0`).
 
 ---
 
@@ -171,6 +201,7 @@ Ember documents what cryptography cannot invent locally (see [`SECURITY.md`](SEC
 
 1. **Key Separation & Backups:** Crypto-shredding protects live logs and snapshots taken *after* erasure only if pre-erasure backups did not copy unshredded keys alongside `ledger.db`. Configure a separate `key_dir` or implement `ember.keystore.KeyStore` over KMS/HSM (`AWS KMS`, `GCP KMS`, `Vault Transit`).
 2. **External Time Anchoring:** Self-signed local `Ed25519` proofs establish internal ordering and integrity; preventing an operator holding both `ledger.db` and `ed25519.json` from backdating the whole chain requires plugging an RFC 3161 TSA or public transparency log via `ember.signing.TimestampAnchor`.
+3. **Wrapped Store Internal History Tables (e.g., Mem0 `history.db`):** `Mem0Adapter` deletes live Mem0 vector points (and Mem0 strips entity links), while Ember's own ledger stays AES-256-GCM encrypted and crypto-shredded. However, `mem0.Memory` also maintains an internal plaintext SQLite history DB (`history_db_path`, logging `old_memory` even on `"DELETE"` events). Treat `history_db_path` as non-shredded vendor state: isolate or purge/rotate it alongside erasure if deployed on disk.
 
 ---
 

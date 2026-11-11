@@ -229,32 +229,52 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def format_benchmark_report(report: dict[str, Any]) -> str:
+    """Format an adversarial erasure benchmark report with explicit adapter & search settings."""
+    adapter = report.get("adapter") or {}
+    adapter_name = adapter.get("name", "unknown")
+    retrieval_mode = adapter.get("retrieval_mode", "unknown")
+    embedding_model = adapter.get("embedding_model") or "none"
+    vector_store = adapter.get("vector_store") or "in-process"
+    search_settings = adapter.get("search_settings") or {}
+    settings_str = ", ".join(f"{k}={v}" for k, v in sorted(search_settings.items())) or "default"
+
+    lines = [
+        f"\nEMBER ERASURE ADVERSARIAL SUITE — {report['subjects']} subjects, "
+        f"{report['total_probes']} probes (7 attack classes)",
+        f"  Adapter   : {adapter_name} (retrieval={retrieval_mode}, store={vector_store})",
+        f"  Embedding : {embedding_model}",
+        f"  Search    : {settings_str}",
+        "=" * 78,
+    ]
+    for row in report["results"]:
+        lines.append(
+            f"  {row['subject']:10} baseline_leaks={row['baseline_naive_leaks']:2d}  "
+            f"ember_leaks={row['ember_leaks']:2d}  derived={row['derived_invalidated']}  "
+            f"bystander_ok={row['bystander_retrievable']}  receipt_ok={row['bystander_receipts_valid']}  "
+            f"replay_clean={row['raw_history_content_free']}"
+        )
+    lines.append("=" * 78)
+    lines.extend(
+        [
+            f"  Adapter              : {adapter_name} ({retrieval_mode}, embed={embedding_model})",
+            f"  Baseline naive leaks : {report['baseline_naive_leaks']}/{report['total_probes']}",
+            f"  Ember leaks          : {report['ember_leaks']}/{report['total_probes']}",
+            f"  Bystanders survived  : {report['all_bystanders_survived']}",
+            f"  Receipts intact      : {report['all_bystander_receipts_valid']}",
+            f"  Replays content-free : {report['all_replays_content_free']}",
+            f"  Ed25519 certs valid  : {report['all_certificates_valid']}",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _cmd_benchmark(args: argparse.Namespace) -> int:
     report = run_benchmark()
     if args.json:
         print(json.dumps(report, indent=2))
     else:
-        print(
-            f"\nEMBER ERASURE ADVERSARIAL SUITE — {report['subjects']} subjects, "
-            f"{report['total_probes']} probes (7 attack classes)\n"
-            + "=" * 78
-        )
-        for row in report["results"]:
-            print(
-                f"  {row['subject']:10} baseline_leaks={row['baseline_naive_leaks']:2d}  "
-                f"ember_leaks={row['ember_leaks']:2d}  derived={row['derived_invalidated']}  "
-                f"bystander_ok={row['bystander_retrievable']}  receipt_ok={row['bystander_receipts_valid']}  "
-                f"replay_clean={row['raw_history_content_free']}"
-            )
-        print("=" * 78)
-        print(
-            f"  Baseline naive leaks : {report['baseline_naive_leaks']}/{report['total_probes']}\n"
-            f"  Ember leaks          : {report['ember_leaks']}/{report['total_probes']}\n"
-            f"  Bystanders survived  : {report['all_bystanders_survived']}\n"
-            f"  Receipts intact      : {report['all_bystander_receipts_valid']}\n"
-            f"  Replays content-free : {report['all_replays_content_free']}\n"
-            f"  Ed25519 certs valid  : {report['all_certificates_valid']}"
-        )
+        print(format_benchmark_report(report))
     return 0 if report["passed"] else 1
 
 

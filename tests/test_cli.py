@@ -93,6 +93,15 @@ def test_cli_end_to_end_custody_lifecycle(tmp_path, capsys):
 
 
 def test_cli_benchmark_command(capsys):
+    assert cli.main(["benchmark"]) == 0
+    text_out = capsys.readouterr().out
+    assert "InMemoryStoreAdapter" in text_out
+    assert "keyword_overlap" in text_out
+    assert "Embedding : none" in text_out
+
     assert cli.main(["benchmark", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["passed"] is True and report["ember_leaks"] == 0
+    assert report["adapter"]["name"] == "InMemoryStoreAdapter"
+    assert report["adapter"]["retrieval_mode"] == "keyword_overlap"
+    assert report["adapter"]["embedding_model"] is None
