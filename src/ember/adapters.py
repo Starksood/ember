@@ -1032,4 +1032,681 @@ class VectorStoreAdapter:
         return len(ids)
 
 
+_VALID_SQL_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+
+
+def _normalize_adapter_metadata(
+    *,
+    item_id: str,
+    subjects: tuple[str, ...],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    encrypted_mode = bool(metadata.get("ember_encrypted"))
+    meta = dict(metadata)
+    meta["ember_item_id"] = item_id
+    if encrypted_mode:
+        meta["ember_subject_refs"] = list(subjects)
+    else:
+        meta["ember_subjects"] = list(subjects)
+        if subjects and "user_id" not in meta:
+            meta["user_id"] = subjects[0]
+    return meta
+
+
+def _scalar_only_chroma_metadata(meta: Mapping[str, Any]) -> dict[str, Any]:
+    """Encode non-scalar metadata lists into JSON strings for Chroma metadata constraints."""
+    out: dict[str, Any] = {}
+    for k, v in meta.items():
+        if v is None or isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        elif isinstance(v, (list, tuple)):
+            out[f"__json_{k}"] = json.dumps(list(v))
+        else:
+            out[k] = str(v)
+    return out
+
+
+def _unpack_chroma_metadata(raw_meta: Mapping[str, Any] | None) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in (raw_meta or {}).items():
+        if isinstance(k, str) and k.startswith("__json_") and isinstance(v, str):
+            try:
+                out[k[7:]] = json.loads(v)
+                continue
+            except ValueError:
+                pass
+        out[k] = v
+    return out
+
+
+def _flatten_pinecone_metadata(meta: Mapping[str, Any]) -> dict[str, Any]:
+    """Ensure metadata values satisfy Pinecone scalar/list[str] constraints cleanly."""
+    out: dict[str, Any] = {}
+    for k, v in meta.items():
+        if v is None:
+            continue
+        if isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        elif isinstance(v, (list, tuple)):
+            out[k] = [str(x) for x in v if x is not None]
+        else:
+            out[k] = json.dumps(v) if isinstance(v, Mapping) else str(v)
+    return out
+
+
+class QdrantAdapter:
+    """Native O(1)-filtered custody adapter for `qdrant_client.QdrantClient`."""
+
+    name = "qdrant"
+    supports_vector = True
+
+    def __init__(
+        self,
+        client: Any,
+        collection_name: str,
+        *,
+        embed_fn: Callable[[str], Sequence[float]] | None = None,
+        text_key: str = "text",
+    ) -> None:
+        if not collection_name or not str(collection_name).strip():
+            raise ValueError("collection_name must be non-empty")
+        self.client = client
+        self.collection_name = collection_name
+        self.embed_fn = embed_fn
+        self.text_key = text_key
+
+    def _build_qdrant_filter(self, filters: Mapping[str, Any] | None) -> Any:
+        if not filters:
+            return None
+        try:
+            from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+            return Filter(
+                must=[
+                    FieldCondition(key=str(k), match=MatchValue(value=v))
+                    for k, v in filters.items()
+                ]
+            )
+        except ImportError:
+            return {"must": [{"key": str(k), "match": {"value": v}} for k, v in filters.items()]}
+
+    def upsert(
+        self,
+        *,
+        item_id: str,
+        text: str,
+        subjects: tuple[str, ...],
+        metadata: dict[str, Any],
+        vector: Sequence[float] | None = None,
+    ) -> tuple[str, ...]:
+        vec = list(float(x) for x in vector) if vector is not None else (
+            list(float(x) for x in self.embed_fn(text)) if self.embed_fn is not None else None
+        )
+        if vec is None:
+            raise ValueError(
+                "QdrantAdapter requires an embedding vector via CustodyVault(embedder=...) or QdrantAdapter(embed_fn=...)"
+            )
+        rec_id = str(uuid.uuid4())
+        payload = _normalize_adapter_metadata(item_id=item_id, subjects=subjects, metadata=metadata)
+        payload[self.text_key] = text
+
+        try:
+            from qdrant_client.models import PointStruct
+
+            point: Any = PointStruct(id=rec_id, vector=vec, payload=payload)
+        except ImportError:
+            point = {"id": rec_id, "vector": vec, "payload": payload}
+
+        self.client.upsert(collection_name=self.collection_name, points=[point])
+        return (rec_id,)
+
+    def _parse_qdrant_points(self, rows: Sequence[Any]) -> list[AdapterHit]:
+        hits: list[AdapterHit] = []
+        for row in rows:
+            if isinstance(row, Mapping):
+                rid = str(row.get("id", ""))
+                score = float(row.get("score", 0.0) or 0.0)
+                payload = dict(row.get("payload") or {})
+            else:
+                rid = str(getattr(row, "id", ""))
+                score = float(getattr(row, "score", 0.0) or 0.0)
+                payload = dict(getattr(row, "payload", None) or {})
+            txt = str(payload.get(self.text_key) or payload.get("memory") or payload.get("text") or "")
+            hits.append(AdapterHit(record_id=rid, text=txt, score=score, metadata=payload))
+        return hits
+
+    def search_vector(
+        self,
+        query_vector: Sequence[float],
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        q_filter = self._build_qdrant_filter(filters)
+        q_vec = [float(x) for x in query_vector]
+        if hasattr(self.client, "query_points"):
+            resp = self.client.query_points(
+                collection_name=self.collection_name,
+                query=q_vec,
+                query_filter=q_filter,
+                limit=limit,
+                with_payload=True,
+            )
+            points = getattr(resp, "points", None)
+            if points is None and isinstance(resp, Mapping):
+                points = resp.get("points", [])
+            return self._parse_qdrant_points(points or [])[:limit]
+        rows = self.client.search(
+            collection_name=self.collection_name,
+            query_vector=q_vec,
+            query_filter=q_filter,
+            limit=limit,
+            with_payload=True,
+        )
+        return self._parse_qdrant_points(rows or [])[:limit]
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        if self.embed_fn is not None:
+            return self.search_vector(self.embed_fn(query), limit=limit, filters=filters)
+        # Token-overlap fallback over Qdrant scroll if no embed_fn was configured
+        scroll_fn = getattr(self.client, "scroll", None)
+        if not callable(scroll_fn):
+            return []
+        q_filter = self._build_qdrant_filter(filters)
+        raw = scroll_fn(
+            collection_name=self.collection_name,
+            scroll_filter=q_filter,
+            limit=max(limit * 4, 25),
+            with_payload=True,
+        )
+        points = raw[0] if isinstance(raw, tuple) else (getattr(raw, "points", None) or raw)
+        q_toks = _content_tokens(query)
+        scored: list[AdapterHit] = []
+        for hit in self._parse_qdrant_points(points or []):
+            overlap = len(q_toks & _tokenize(hit.text))
+            if overlap > 0 or query.strip().lower() in hit.text.lower():
+                scored.append(
+                    AdapterHit(
+                        record_id=hit.record_id,
+                        text=hit.text,
+                        score=overlap / max(1, len(q_toks)),
+                        metadata=hit.metadata,
+                    )
+                )
+        scored.sort(key=lambda h: (-h.score, h.record_id))
+        return scored[:limit]
+
+    def delete(self, record_ids: Sequence[str]) -> int:
+        ids = list(dict.fromkeys(str(rid) for rid in record_ids if rid))
+        if not ids:
+            return 0
+        try:
+            from qdrant_client.models import PointIdsList
+
+            selector: Any = PointIdsList(points=ids)
+        except ImportError:
+            selector = {"points": ids}
+        self.client.delete(collection_name=self.collection_name, points_selector=selector)
+        return len(ids)
+
+
+class ChromaAdapter:
+    """Native O(1)-filtered custody adapter wrapping a `chromadb.Collection`."""
+
+    name = "chroma"
+    supports_vector = True
+
+    def __init__(
+        self,
+        collection: Any,
+        *,
+        embed_fn: Callable[[str], Sequence[float]] | None = None,
+    ) -> None:
+        self.collection = collection
+        self.embed_fn = embed_fn
+
+    @staticmethod
+    def _build_where(filters: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if not filters:
+            return None
+        items = list(filters.items())
+        if len(items) == 1:
+            k, v = items[0]
+            return {str(k): v}
+        return {"$and": [{str(k): v} for k, v in items]}
+
+    def upsert(
+        self,
+        *,
+        item_id: str,
+        text: str,
+        subjects: tuple[str, ...],
+        metadata: dict[str, Any],
+        vector: Sequence[float] | None = None,
+    ) -> tuple[str, ...]:
+        rec_id = f"chr_{uuid.uuid4().hex[:12]}"
+        meta = _scalar_only_chroma_metadata(
+            _normalize_adapter_metadata(item_id=item_id, subjects=subjects, metadata=metadata)
+        )
+        vec = list(float(x) for x in vector) if vector is not None else (
+            list(float(x) for x in self.embed_fn(text)) if self.embed_fn is not None else None
+        )
+        kwargs: dict[str, Any] = {
+            "ids": [rec_id],
+            "documents": [text],
+            "metadatas": [meta],
+        }
+        if vec is not None:
+            kwargs["embeddings"] = [vec]
+        upsert_fn = getattr(self.collection, "upsert", None)
+        if callable(upsert_fn):
+            upsert_fn(**kwargs)
+        else:
+            self.collection.add(**kwargs)
+        return (rec_id,)
+
+    def _parse_query_result(self, raw: Mapping[str, Any]) -> list[AdapterHit]:
+        ids_batch = raw.get("ids") or [[]]
+        docs_batch = raw.get("documents") or [[]]
+        metas_batch = raw.get("metadatas") or [[]]
+        dists_batch = raw.get("distances") or [[]]
+        ids = ids_batch[0] if ids_batch else []
+        docs = docs_batch[0] if docs_batch else []
+        metas = metas_batch[0] if metas_batch else []
+        dists = dists_batch[0] if dists_batch else []
+        hits: list[AdapterHit] = []
+        for idx, rid in enumerate(ids):
+            txt = str(docs[idx] if idx < len(docs) and docs[idx] is not None else "")
+            meta = _unpack_chroma_metadata(metas[idx] if idx < len(metas) else None)
+            dist = float(dists[idx]) if idx < len(dists) and dists[idx] is not None else 0.0
+            score = 1.0 / (1.0 + max(0.0, dist))
+            hits.append(AdapterHit(record_id=str(rid), text=txt, score=score, metadata=meta))
+        return hits
+
+    def search_vector(
+        self,
+        query_vector: Sequence[float],
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        kwargs: dict[str, Any] = {
+            "query_embeddings": [[float(x) for x in query_vector]],
+            "n_results": limit,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        where = self._build_where(filters)
+        if where is not None:
+            kwargs["where"] = where
+        return self._parse_query_result(self.collection.query(**kwargs))[:limit]
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        if self.embed_fn is not None:
+            return self.search_vector(self.embed_fn(query), limit=limit, filters=filters)
+        kwargs: dict[str, Any] = {
+            "query_texts": [query],
+            "n_results": limit,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        where = self._build_where(filters)
+        if where is not None:
+            kwargs["where"] = where
+        return self._parse_query_result(self.collection.query(**kwargs))[:limit]
+
+    def delete(self, record_ids: Sequence[str]) -> int:
+        ids = list(dict.fromkeys(str(rid) for rid in record_ids if rid))
+        if not ids:
+            return 0
+        self.collection.delete(ids=ids)
+        return len(ids)
+
+
+class PgVectorAdapter:
+    """Native O(1)-filtered PostgreSQL + pgvector adapter with parameterized SQL & JSONB filters."""
+
+    name = "pgvector"
+    supports_vector = True
+
+    def __init__(
+        self,
+        connection: Any,
+        *,
+        table_name: str = "ember_vectors",
+        dimensions: int = 384,
+        embed_fn: Callable[[str], Sequence[float]] | None = None,
+        create_table: bool = True,
+    ) -> None:
+        if not _VALID_SQL_IDENT.fullmatch(table_name):
+            raise ValueError(f"invalid SQL table_name {table_name!r}")
+        if dimensions <= 0:
+            raise ValueError("dimensions must be positive")
+        self.conn = connection
+        self.table_name = table_name
+        self.dimensions = int(dimensions)
+        self.embed_fn = embed_fn
+        self._lock = threading.RLock()
+        if create_table:
+            self._init_table()
+
+    def _run(self, sql_template: str, params: Sequence[Any] = ()) -> Any:
+        sql = sql_template.replace("__TBL__", self.table_name).replace("__DIMS__", str(self.dimensions))
+        cur = self.conn.cursor()
+        try:
+            if params:
+                cur.execute(sql, tuple(params))
+            else:
+                cur.execute(sql)
+            return cur
+        finally:
+            if hasattr(cur, "close"):
+                cur.close()
+
+    def _init_table(self) -> None:
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                ddl = (
+                    "CREATE TABLE IF NOT EXISTS __TBL__ ("
+                    "record_id TEXT PRIMARY KEY, "
+                    "item_id TEXT NOT NULL, "
+                    "text TEXT NOT NULL, "
+                    "meta_json JSONB NOT NULL, "
+                    "embedding vector(__DIMS__)"
+                    ")"
+                ).replace("__TBL__", self.table_name).replace("__DIMS__", str(self.dimensions))
+                cur.execute(ddl)
+                self.conn.commit()
+            except BaseException:
+                if hasattr(self.conn, "rollback"):
+                    self.conn.rollback()
+                raise
+            finally:
+                if hasattr(cur, "close"):
+                    cur.close()
+
+    @staticmethod
+    def _vec_literal(vector: Sequence[float]) -> str:
+        return "[" + ",".join(str(float(x)) for x in vector) + "]"
+
+    def upsert(
+        self,
+        *,
+        item_id: str,
+        text: str,
+        subjects: tuple[str, ...],
+        metadata: dict[str, Any],
+        vector: Sequence[float] | None = None,
+    ) -> tuple[str, ...]:
+        rec_id = f"pgv_{uuid.uuid4().hex[:12]}"
+        meta = _normalize_adapter_metadata(item_id=item_id, subjects=subjects, metadata=metadata)
+        vec = list(float(x) for x in vector) if vector is not None else (
+            list(float(x) for x in self.embed_fn(text)) if self.embed_fn is not None else None
+        )
+        vec_lit = self._vec_literal(vec) if vec is not None else None
+        meta_str = json.dumps(meta, sort_keys=True)
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                sql = (
+                    "INSERT INTO __TBL__ (record_id, item_id, text, meta_json, embedding) "
+                    "VALUES (%s, %s, %s, %s::jsonb, %s::vector) "
+                    "ON CONFLICT (record_id) DO UPDATE SET "
+                    "item_id = EXCLUDED.item_id, text = EXCLUDED.text, "
+                    "meta_json = EXCLUDED.meta_json, embedding = EXCLUDED.embedding"
+                ).replace("__TBL__", self.table_name)
+                cur.execute(sql, (rec_id, item_id, text, meta_str, vec_lit))
+                self.conn.commit()
+            except BaseException:
+                if hasattr(self.conn, "rollback"):
+                    self.conn.rollback()
+                raise
+            finally:
+                if hasattr(cur, "close"):
+                    cur.close()
+        return (rec_id,)
+
+    def search_vector(
+        self,
+        query_vector: Sequence[float],
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        vec_lit = self._vec_literal(query_vector)
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                if filters:
+                    sql = (
+                        "SELECT record_id, text, meta_json, (1 - (embedding <=> %s::vector)) AS score "
+                        "FROM __TBL__ "
+                        "WHERE embedding IS NOT NULL AND meta_json @> %s::jsonb "
+                        "ORDER BY embedding <=> %s::vector ASC LIMIT %s"
+                    ).replace("__TBL__", self.table_name)
+                    cur.execute(sql, (vec_lit, json.dumps(dict(filters), sort_keys=True), vec_lit, limit))
+                else:
+                    sql = (
+                        "SELECT record_id, text, meta_json, (1 - (embedding <=> %s::vector)) AS score "
+                        "FROM __TBL__ "
+                        "WHERE embedding IS NOT NULL "
+                        "ORDER BY embedding <=> %s::vector ASC LIMIT %s"
+                    ).replace("__TBL__", self.table_name)
+                    cur.execute(sql, (vec_lit, vec_lit, limit))
+                rows = cur.fetchall()
+            finally:
+                if hasattr(cur, "close"):
+                    cur.close()
+        hits: list[AdapterHit] = []
+        for rec_id, text, meta_val, score in rows:
+            meta = dict(meta_val) if isinstance(meta_val, Mapping) else json.loads(meta_val)
+            hits.append(AdapterHit(record_id=str(rec_id), text=str(text), score=float(score), metadata=meta))
+        return hits[:limit]
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        if self.embed_fn is not None:
+            return self.search_vector(self.embed_fn(query), limit=limit, filters=filters)
+        q_toks = sorted(_content_tokens(query))
+        pattern = "|".join(re.escape(tok) for tok in q_toks) if q_toks else ""
+        filter_json = json.dumps(dict(filters), sort_keys=True) if filters else None
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                if filters and pattern:
+                    sql = (
+                        "SELECT record_id, text, meta_json FROM __TBL__ "
+                        "WHERE meta_json @> %s::jsonb AND text ~* %s LIMIT %s"
+                    ).replace("__TBL__", self.table_name)
+                    cur.execute(sql, (filter_json, pattern, limit))
+                elif filters:
+                    sql = (
+                        "SELECT record_id, text, meta_json FROM __TBL__ "
+                        "WHERE meta_json @> %s::jsonb LIMIT %s"
+                    ).replace("__TBL__", self.table_name)
+                    cur.execute(sql, (filter_json, limit))
+                elif pattern:
+                    sql = (
+                        "SELECT record_id, text, meta_json FROM __TBL__ "
+                        "WHERE text ~* %s LIMIT %s"
+                    ).replace("__TBL__", self.table_name)
+                    cur.execute(sql, (pattern, limit))
+                else:
+                    sql = ("SELECT record_id, text, meta_json FROM __TBL__ LIMIT %s").replace("__TBL__", self.table_name)
+                    cur.execute(sql, (limit,))
+                rows = cur.fetchall()
+            finally:
+                if hasattr(cur, "close"):
+                    cur.close()
+        q_set = _content_tokens(query)
+        hits: list[AdapterHit] = []
+        for rec_id, text, meta_val in rows:
+            meta = dict(meta_val) if isinstance(meta_val, Mapping) else json.loads(meta_val)
+            overlap = len(q_set & _tokenize(str(text)))
+            score = overlap / max(1, len(q_set))
+            hits.append(AdapterHit(record_id=str(rec_id), text=str(text), score=score, metadata=meta))
+        hits.sort(key=lambda h: (-h.score, h.record_id))
+        return hits[:limit]
+
+    def delete(self, record_ids: Sequence[str]) -> int:
+        ids = list(dict.fromkeys(str(rid) for rid in record_ids if rid))
+        if not ids:
+            return 0
+        sql = ("DELETE FROM __TBL__ WHERE record_id = ANY(%s)").replace("__TBL__", self.table_name)
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute(sql, (ids,))
+                deleted = cur.rowcount if getattr(cur, "rowcount", -1) >= 0 else len(ids)
+                self.conn.commit()
+                return int(deleted)
+            except BaseException:
+                if hasattr(self.conn, "rollback"):
+                    self.conn.rollback()
+                raise
+            finally:
+                if hasattr(cur, "close"):
+                    cur.close()
+
+
+class PineconeAdapter:
+    """Native O(1)-filtered custody adapter wrapping a Pinecone `Index`."""
+
+    name = "pinecone"
+    supports_vector = True
+
+    def __init__(
+        self,
+        index: Any,
+        *,
+        namespace: str = "",
+        embed_fn: Callable[[str], Sequence[float]] | None = None,
+        text_key: str = "text",
+    ) -> None:
+        self.index = index
+        self.namespace = namespace
+        self.embed_fn = embed_fn
+        self.text_key = text_key
+
+    @staticmethod
+    def _build_filter(filters: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if not filters:
+            return None
+        return {str(k): {"$eq": v} for k, v in filters.items()}
+
+    def upsert(
+        self,
+        *,
+        item_id: str,
+        text: str,
+        subjects: tuple[str, ...],
+        metadata: dict[str, Any],
+        vector: Sequence[float] | None = None,
+    ) -> tuple[str, ...]:
+        vec = list(float(x) for x in vector) if vector is not None else (
+            list(float(x) for x in self.embed_fn(text)) if self.embed_fn is not None else None
+        )
+        if vec is None:
+            raise ValueError(
+                "PineconeAdapter requires vector embeddings via CustodyVault(embedder=...) or PineconeAdapter(embed_fn=...)"
+            )
+        rec_id = f"pc_{uuid.uuid4().hex[:12]}"
+        meta = _flatten_pinecone_metadata(
+            _normalize_adapter_metadata(item_id=item_id, subjects=subjects, metadata=metadata)
+        )
+        meta[self.text_key] = text
+        self.index.upsert(
+            vectors=[{"id": rec_id, "values": vec, "metadata": meta}],
+            namespace=self.namespace,
+        )
+        return (rec_id,)
+
+    def _parse_matches(self, resp: Any) -> list[AdapterHit]:
+        matches = resp.get("matches", []) if isinstance(resp, Mapping) else (getattr(resp, "matches", None) or [])
+        hits: list[AdapterHit] = []
+        for m in matches:
+            if isinstance(m, Mapping):
+                rid = str(m.get("id", ""))
+                score = float(m.get("score", 0.0) or 0.0)
+                meta = dict(m.get("metadata") or {})
+            else:
+                rid = str(getattr(m, "id", ""))
+                score = float(getattr(m, "score", 0.0) or 0.0)
+                meta = dict(getattr(m, "metadata", None) or {})
+            txt = str(meta.get(self.text_key) or meta.get("memory") or meta.get("text") or "")
+            hits.append(AdapterHit(record_id=rid, text=txt, score=score, metadata=meta))
+        return hits
+
+    def search_vector(
+        self,
+        query_vector: Sequence[float],
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        kwargs: dict[str, Any] = {
+            "vector": [float(x) for x in query_vector],
+            "top_k": limit,
+            "include_metadata": True,
+            "namespace": self.namespace,
+        }
+        pc_filter = self._build_filter(filters)
+        if pc_filter is not None:
+            kwargs["filter"] = pc_filter
+        return self._parse_matches(self.index.query(**kwargs))[:limit]
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[AdapterHit]:
+        if limit <= 0:
+            return []
+        if self.embed_fn is not None:
+            return self.search_vector(self.embed_fn(query), limit=limit, filters=filters)
+        raise ValueError(
+            "PineconeAdapter text search requires an embed_fn (pass embedder= to CustodyVault or embed_fn= to PineconeAdapter)"
+        )
+
+    def delete(self, record_ids: Sequence[str]) -> int:
+        ids = list(dict.fromkeys(str(rid) for rid in record_ids if rid))
+        if not ids:
+            return 0
+        self.index.delete(ids=ids, namespace=self.namespace)
+        return len(ids)
+
+
 ProbeFilterFn = Callable[[AdapterHit], bool]

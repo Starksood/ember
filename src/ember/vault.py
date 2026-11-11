@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Iterable, Mapping, Sequence
 import contextvars
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import inspect
 import json
 from pathlib import Path
 import re
@@ -25,8 +27,8 @@ from .adapters import (
     _tokenize,
 )
 from .crypto import CIPHER_NAME, ERASED_TOMBSTONE, build_aad, encrypt_text
-from .keystore import FileKeyStore, KeyStore, MemoryKeyStore
-from .ledger import SQLiteLedger
+from .keystore import FileKeyStore, KeyStore, MemoryKeyStore, SQLiteKeyStore
+from .ledger import LedgerBackend, SQLiteLedger
 from .merkle import ChunkMode, ChunkerFn, RedactableDoc, SpanChunkerFn, SpanMode, _entry_text
 from .receipts import Receipt, mint_redactable_receipt
 from .records import ErasureCertificate, MemoryItem, SourceRecord
@@ -255,6 +257,7 @@ class TurnTrace:
     _manual_reads: list[str] = field(default_factory=list)
     _written: list[str] = field(default_factory=list)
     _token: contextvars.Token[dict[str, "TurnTrace"] | None] | None = None
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def __enter__(self) -> "TurnTrace":
         cur = _ACTIVE_TRACES.get()
@@ -268,54 +271,69 @@ class TurnTrace:
             _ACTIVE_TRACES.reset(self._token)
             self._token = None
 
+    async def __aenter__(self) -> "TurnTrace":
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.__exit__(exc_type, exc, tb)
+
     @property
     def hits(self) -> tuple[QueryHit, ...]:
-        return tuple(self._hits)
+        with self._lock:
+            return tuple(self._hits)
 
     @property
     def read_ids(self) -> tuple[str, ...]:
-        combined = [h.item_id for h in self._hits]
-        combined.extend(self._manual_reads)
-        return tuple(dict.fromkeys(combined))
+        with self._lock:
+            combined = [h.item_id for h in self._hits]
+            combined.extend(self._manual_reads)
+            return tuple(dict.fromkeys(combined))
 
     @property
     def written_ids(self) -> tuple[str, ...]:
-        return tuple(self._written)
+        with self._lock:
+            return tuple(self._written)
 
     def record_read(self, hit_or_id: QueryHit | str) -> None:
-        if isinstance(hit_or_id, QueryHit):
-            self._hits.append(hit_or_id)
-        elif isinstance(hit_or_id, str) and hit_or_id.strip():
-            self._manual_reads.append(hit_or_id.strip())
+        with self._lock:
+            if isinstance(hit_or_id, QueryHit):
+                self._hits.append(hit_or_id)
+            elif isinstance(hit_or_id, str) and hit_or_id.strip():
+                self._manual_reads.append(hit_or_id.strip())
 
     def record_write(self, item_id: str) -> None:
-        if item_id:
-            self._written.append(item_id)
+        with self._lock:
+            if item_id:
+                self._written.append(item_id)
 
     def clear_reads(self) -> None:
-        self._hits.clear()
-        self._manual_reads.clear()
+        with self._lock:
+            self._hits.clear()
+            self._manual_reads.clear()
 
     def select_citations(self, text: str) -> tuple[str, ...]:
         if not self.auto_cite:
             return ()
-        all_reads = self.read_ids
-        if not all_reads:
-            return ()
+        with self._lock:
+            all_reads = self.read_ids
+            if not all_reads:
+                return ()
+            hits_copy = list(self._hits)
+            manual_copy = list(self._manual_reads)
         if callable(self.prune):
-            chosen = [str(x).strip() for x in self.prune(text, list(self._hits)) if str(x).strip()]
+            chosen = [str(x).strip() for x in self.prune(text, hits_copy) if str(x).strip()]
             return tuple(dict.fromkeys(chosen))
         if self.prune == "lexical":
             written_toks = _content_tokens(text)
             written_all = _tokenize(text)
             matched: list[str] = []
-            for h in self._hits:
+            for h in hits_copy:
                 h_toks = _content_tokens(h.text)
                 if (written_toks & h_toks) or any(
                     _tokenize(subj) & written_all for subj in h.subjects
                 ):
                     matched.append(h.item_id)
-            matched.extend(self._manual_reads)
+            matched.extend(manual_copy)
             return tuple(dict.fromkeys(matched))
         if self.prune in ("all", None):
             return all_reads
@@ -328,7 +346,7 @@ class CustodyVault:
     def __init__(
         self,
         *,
-        ledger: SQLiteLedger,
+        ledger: LedgerBackend,
         keystore: KeyStore,
         signer: Ed25519Signer,
         tenant_id: str = "default",
@@ -337,9 +355,13 @@ class CustodyVault:
         keys_separated_from_ledger: bool = False,
         encrypt_vendor_payload: bool = False,
         embedder: Any = None,
+        auto_checkpoint_every: int | None = None,
+        use_checkpoint: bool = True,
     ) -> None:
         if not isinstance(tenant_id, str) or not tenant_id.strip():
             raise ValueError("tenant_id must be a non-empty string")
+        if auto_checkpoint_every is not None and auto_checkpoint_every < 1:
+            raise ValueError("auto_checkpoint_every must be >= 1")
         resolved_adapter: MemoryStoreAdapter = adapter if adapter is not None else InMemoryStoreAdapter()
         if encrypt_vendor_payload and isinstance(resolved_adapter, Mem0Adapter) and resolved_adapter.infer:
             raise ValueError(
@@ -350,6 +372,7 @@ class CustodyVault:
         self._trace_key = f"vault_{uuid.uuid4().hex}"
         self.ledger = ledger
         self.keystore = keystore
+        self._owns_keystore = False
         self.signer = signer
         self.tenant_id = tenant_id
         self.adapter = resolved_adapter
@@ -358,8 +381,47 @@ class CustodyVault:
         self.encrypt_vendor_payload = encrypt_vendor_payload
         self.embedder = embedder
         self._embed_fn = _resolve_embed_fn(embedder)
-        self.state: EmberState = self.ledger.replay(self.tenant_id, keystore=self.keystore)
+        self.auto_checkpoint_every = auto_checkpoint_every
+        self._ops_since_checkpoint = 0
+        self.state: EmberState = self._replay_state(
+            keystore=self.keystore,
+            use_checkpoint=use_checkpoint,
+        )
         self._sync_adapter_scopes()
+
+    def _replay_state(self, *, keystore: KeyStore | None, use_checkpoint: bool) -> EmberState:
+        sig = inspect.signature(self.ledger.replay)
+        params = set(sig.parameters)
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        kwargs: dict[str, Any] = {"keystore": keystore}
+        if "use_checkpoint" in params or has_varkw:
+            kwargs["use_checkpoint"] = use_checkpoint
+        if "checkpoint_public_key" in params or has_varkw:
+            kwargs["checkpoint_public_key"] = self.signer.public_key_hex
+        return self.ledger.replay(self.tenant_id, **kwargs)
+
+    def checkpoint(self) -> dict[str, Any]:
+        """Persist an Ed25519-signed ciphertext-only state snapshot for O(delta) restarts."""
+        with self._lock:
+            save_fn = getattr(self.ledger, "save_checkpoint", None)
+            if not callable(save_fn):
+                raise NotImplementedError(f"{type(self.ledger).__name__} does not support checkpoints")
+            ckpt = save_fn(
+                self.tenant_id,
+                self.state,
+                sign_fn=self.signer.sign,
+                public_key_hex=self.signer.public_key_hex,
+            )
+            self._ops_since_checkpoint = 0
+            return ckpt
+
+    def _maybe_auto_checkpoint(self) -> None:
+        if self.auto_checkpoint_every is None:
+            return
+        self._ops_since_checkpoint += 1
+        if self._ops_since_checkpoint >= self.auto_checkpoint_every:
+            if callable(getattr(self.ledger, "save_checkpoint", None)):
+                self.checkpoint()
 
     def _sync_adapter_scopes(self) -> None:
         """Seed scope-aware adapters (e.g., Mem0Adapter) from replayed state after restart."""
@@ -411,26 +473,54 @@ class CustodyVault:
         anchor: TimestampAnchor | None = None,
         encrypt_vendor_payload: bool = False,
         embedder: Any = None,
+        ledger: LedgerBackend | None = None,
+        keystore: KeyStore | None = None,
+        keystore_backend: str = "file",
+        auto_checkpoint_every: int | None = None,
+        use_checkpoint: bool = True,
     ) -> "CustodyVault":
-        """Open or create a persistent vault on disk.
+        """Open or create a persistent vault on disk (or plug custom `LedgerBackend` / `KeyStore`).
 
         For real deployments, pass an explicit `key_dir` outside `data_dir` (or pass a KMS-backed
-        `KeyStore`) so ledger backups never contain live content decryption keys.
+        `KeyStore` / `PostgresLedger`) so ledger backups never contain live content decryption keys.
         """
         data_path = Path(data_dir).resolve()
         data_path.mkdir(parents=True, exist_ok=True)
         resolved_key_dir = Path(key_dir).resolve() if key_dir is not None else (data_path / "keys")
-        separated = key_dir is not None and not resolved_key_dir.is_relative_to(data_path)
 
-        ledger = SQLiteLedger(data_path / "ledger.db")
+        resolved_ledger: LedgerBackend = ledger if ledger is not None else SQLiteLedger(data_path / "ledger.db")
+        resolved_keystore: KeyStore | None = keystore
+        owns_keystore = False
         try:
-            keystore = FileKeyStore(resolved_key_dir / "keyring.json")
+            if resolved_keystore is None:
+                if keystore_backend == "sqlite":
+                    resolved_keystore = SQLiteKeyStore(resolved_key_dir / "keys.db")
+                    owns_keystore = True
+                elif keystore_backend == "file":
+                    resolved_keystore = FileKeyStore(resolved_key_dir / "keyring.json")
+                else:
+                    raise ValueError(f"unsupported keystore_backend: {keystore_backend!r}")
+
             resolved_signer = (
                 signer if signer is not None else Ed25519Signer.load_or_create(resolved_key_dir / "ed25519.json")
             )
-            return cls(
-                ledger=ledger,
-                keystore=keystore,
+
+            ledger_path = getattr(resolved_ledger, "path", None)
+            ks_path = getattr(resolved_keystore, "path", None)
+            if isinstance(resolved_keystore, MemoryKeyStore) and not isinstance(resolved_keystore, FileKeyStore):
+                separated = True
+            elif hasattr(resolved_keystore, "key_id") or hasattr(resolved_keystore, "key_name"):
+                separated = True
+            elif ledger_path is None or str(ledger_path) == ":memory:":
+                separated = True
+            elif ks_path is not None and str(ks_path) != ":memory:":
+                separated = not Path(str(ks_path)).resolve().is_relative_to(Path(str(ledger_path)).resolve().parent)
+            else:
+                separated = key_dir is not None and not resolved_key_dir.is_relative_to(data_path)
+
+            vault = cls(
+                ledger=resolved_ledger,
+                keystore=resolved_keystore,
                 signer=resolved_signer,
                 tenant_id=tenant_id,
                 adapter=adapter,
@@ -438,9 +528,18 @@ class CustodyVault:
                 keys_separated_from_ledger=separated,
                 encrypt_vendor_payload=encrypt_vendor_payload,
                 embedder=embedder,
+                auto_checkpoint_every=auto_checkpoint_every,
+                use_checkpoint=use_checkpoint,
             )
+            vault._owns_keystore = owns_keystore
+            return vault
         except BaseException:
-            ledger.close()
+            if ledger is None:
+                resolved_ledger.close()
+            if owns_keystore and resolved_keystore is not None:
+                close_ks = getattr(resolved_keystore, "close", None)
+                if callable(close_ks):
+                    close_ks()
             raise
 
     @classmethod
@@ -453,6 +552,8 @@ class CustodyVault:
         anchor: TimestampAnchor | None = None,
         encrypt_vendor_payload: bool = False,
         embedder: Any = None,
+        auto_checkpoint_every: int | None = None,
+        use_checkpoint: bool = True,
     ) -> "CustodyVault":
         """Open a clean in-memory vault for fast tests, notebooks, and demos."""
         ledger = SQLiteLedger(":memory:")
@@ -467,6 +568,8 @@ class CustodyVault:
                 keys_separated_from_ledger=True,
                 encrypt_vendor_payload=encrypt_vendor_payload,
                 embedder=embedder,
+                auto_checkpoint_every=auto_checkpoint_every,
+                use_checkpoint=use_checkpoint,
             )
         except BaseException:
             ledger.close()
@@ -475,6 +578,10 @@ class CustodyVault:
     def close(self) -> None:
         with self._lock:
             self.ledger.close()
+            if self._owns_keystore:
+                close_ks = getattr(self.keystore, "close", None)
+                if callable(close_ks):
+                    close_ks()
 
     def register_source(
         self,
@@ -526,6 +633,7 @@ class CustodyVault:
                 raise RuntimeError("ledger.append unexpectedly returned None state")
             self.ledger.put_document(self.tenant_id, doc)
             self.state = next_state
+            self._maybe_auto_checkpoint()
             return record, doc
 
     def _effective_owners(self, subjects: Sequence[str], derived_from: Sequence[str]) -> set[str]:
@@ -866,6 +974,7 @@ class CustodyVault:
             if next_state is None:
                 raise RuntimeError("ledger.append unexpectedly returned None state")
             self.state = next_state
+            self._maybe_auto_checkpoint()
             if trace is not None:
                 trace.record_write(resolved_item_id)
             return RememberResult(
@@ -1378,12 +1487,21 @@ class CustodyVault:
                 signature=signed_dict["signature"],
             )
             self.ledger.put_certificate(cert.as_dict())
+            self._maybe_auto_checkpoint()
             return cert
 
-    def replay(self, *, keystore: KeyStore | None = None) -> EmberState:
-        """Reconstruct materialized custody state from zero via ledger replay."""
+    def replay(
+        self,
+        *,
+        keystore: KeyStore | None = None,
+        use_checkpoint: bool = False,
+    ) -> EmberState:
+        """Reconstruct materialized custody state via full genesis replay (or checkpoint + delta)."""
         with self._lock:
-            return self.ledger.replay(self.tenant_id, keystore=keystore if keystore is not None else self.keystore)
+            return self._replay_state(
+                keystore=keystore if keystore is not None else self.keystore,
+                use_checkpoint=use_checkpoint,
+            )
 
     def export_bundle(self, *, include_ledger: bool = True) -> dict[str, Any]:
         """Export self-contained redacted verification bundle checkable offline by `ember.verify`."""
@@ -1410,3 +1528,119 @@ class CustodyVault:
             if include_ledger:
                 bundle["ledger_events"] = [ev.as_dict() for ev in self.ledger.events(self.tenant_id)]
             return bundle
+
+
+class AsyncCustodyVault:
+    """Native `asyncio` wrapper around `CustodyVault` for async agent frameworks & FastAPI services."""
+
+    def __init__(self, vault: CustodyVault) -> None:
+        self._vault = vault
+
+    @property
+    def sync(self) -> CustodyVault:
+        return self._vault
+
+    @property
+    def tenant_id(self) -> str:
+        return self._vault.tenant_id
+
+    @property
+    def signer(self) -> Ed25519Signer:
+        return self._vault.signer
+
+    @property
+    def state(self) -> EmberState:
+        return self._vault.state
+
+    @property
+    def ledger(self) -> LedgerBackend:
+        return self._vault.ledger
+
+    @property
+    def keystore(self) -> KeyStore:
+        return self._vault.keystore
+
+    @property
+    def adapter(self) -> MemoryStoreAdapter:
+        return self._vault.adapter
+
+    @classmethod
+    async def open(cls, data_dir: str | Path, **kwargs: Any) -> "AsyncCustodyVault":
+        vault = await asyncio.to_thread(CustodyVault.open, data_dir, **kwargs)
+        return cls(vault)
+
+    @classmethod
+    async def ephemeral(cls, **kwargs: Any) -> "AsyncCustodyVault":
+        vault = await asyncio.to_thread(CustodyVault.ephemeral, **kwargs)
+        return cls(vault)
+
+    async def __aenter__(self) -> "AsyncCustodyVault":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._vault.close)
+
+    def trace_turn(
+        self,
+        *,
+        auto_cite: bool = True,
+        prune: str | Callable[[str, list[QueryHit]], Sequence[str]] = "all",
+    ) -> TurnTrace:
+        """Return an async context manager tracking concurrent `search()` -> `remember()` lineage."""
+        return self._vault.trace_turn(auto_cite=auto_cite, prune=prune)
+
+    async def register_source(
+        self,
+        source_id: str,
+        text: str,
+        **kwargs: Any,
+    ) -> tuple[SourceRecord, RedactableDoc]:
+        return await asyncio.to_thread(self._vault.register_source, source_id, text, **kwargs)
+
+    async def remember(
+        self,
+        text: str,
+        *,
+        subjects: Iterable[str],
+        **kwargs: Any,
+    ) -> RememberResult:
+        return await asyncio.to_thread(self._vault.remember, text, subjects=subjects, **kwargs)
+
+    async def search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        filters: dict[str, Any] | None = None,
+        verify_receipts: bool = True,
+    ) -> SearchResult:
+        return await asyncio.to_thread(
+            self._vault.search,
+            query,
+            limit=limit,
+            filters=filters,
+            verify_receipts=verify_receipts,
+        )
+
+    async def erase(self, subject_id: str, **kwargs: Any) -> ErasureCertificate:
+        return await asyncio.to_thread(self._vault.erase, subject_id, **kwargs)
+
+    async def checkpoint(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._vault.checkpoint)
+
+    async def replay(
+        self,
+        *,
+        keystore: KeyStore | None = None,
+        use_checkpoint: bool = False,
+    ) -> EmberState:
+        return await asyncio.to_thread(self._vault.replay, keystore=keystore, use_checkpoint=use_checkpoint)
+
+    async def verify_item_receipt(self, item_id: str) -> bool:
+        return await asyncio.to_thread(self._vault.verify_item_receipt, item_id)
+
+    async def export_bundle(self, *, include_ledger: bool = True) -> dict[str, Any]:
+        return await asyncio.to_thread(self._vault.export_bundle, include_ledger=include_ledger)

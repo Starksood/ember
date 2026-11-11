@@ -10,30 +10,95 @@ import sys
 from typing import Any
 
 from . import __version__
-from .adapters import SQLiteStoreAdapter
+from .adapters import InMemoryStoreAdapter, MemoryStoreAdapter, SQLiteStoreAdapter
 from .audit import run_benchmark
+from .config import EmberConfig, load_ember_config, open_vault_from_config
 from .crypto import DecryptionError, ERASED_TOMBSTONE
+from .kms import KmsOperationError
 from .ledger import IdempotencyConflict, LedgerIntegrityError
 from .reducer import ErasureIncomplete, InvariantViolation, TombstonedSubjectError
+from .signing import NullAnchor, RekorAnchor, Rfc3161Anchor, TimestampAnchor
 from .vault import CustodyVault
 from .verify import verify_bundle
 
 
-def _vault(args: argparse.Namespace) -> tuple[CustodyVault, SQLiteStoreAdapter]:
+def _resolve_cli_anchor(args: argparse.Namespace) -> TimestampAnchor | None:
+    if getattr(args, "tsa_url", None):
+        return Rfc3161Anchor(args.tsa_url)
+    if getattr(args, "rekor_url", None):
+        return RekorAnchor(args.rekor_url)
+    return None
+
+
+def _vault(args: argparse.Namespace) -> tuple[CustodyVault, Any]:
+    cli_anchor = _resolve_cli_anchor(args)
+    if getattr(args, "config", None):
+        cfg = load_ember_config(args.config)
+        data_dir = Path(args.vault).resolve() if getattr(args, "vault_explicit", False) else cfg.data_dir
+        key_dir = Path(args.key_dir).resolve() if args.key_dir else cfg.key_dir
+        tenant_id = args.tenant if getattr(args, "tenant_explicit", False) else cfg.tenant_id
+        ks_cfg = dict(cfg.keystore)
+        if getattr(args, "keystore_backend", None) is not None:
+            ks_cfg["backend"] = args.keystore_backend
+        adapter_cfg = dict(cfg.adapter)
+        if getattr(args, "adapter", None) is not None:
+            adapter_cfg["backend"] = args.adapter
+        patched = EmberConfig(
+            data_dir=data_dir,
+            key_dir=key_dir,
+            tenant_id=tenant_id,
+            encrypt_vendor_payload=bool(args.encrypt_vendor_payload) or cfg.encrypt_vendor_payload,
+            auto_checkpoint_every=cfg.auto_checkpoint_every,
+            use_checkpoint=cfg.use_checkpoint,
+            ledger=cfg.ledger,
+            keystore=ks_cfg,
+            adapter=adapter_cfg,
+            anchor=cfg.anchor,
+            server=cfg.server,
+            source_path=cfg.source_path,
+        )
+        vault = open_vault_from_config(patched, anchor=cli_anchor)
+        return vault, None
+
     data_dir = Path(args.vault)
     key_dir = Path(args.key_dir) if args.key_dir else None
-    store = SQLiteStoreAdapter(str(data_dir / "store.db"))
+    adapter_name = getattr(args, "adapter", None) or "sqlite"
+    store: MemoryStoreAdapter
+    closable_store: Any = None
+    if adapter_name == "memory":
+        store = InMemoryStoreAdapter()
+    elif adapter_name == "sqlite":
+        sql_store = SQLiteStoreAdapter(str(data_dir / "store.db"))
+        store = sql_store
+        closable_store = sql_store
+    else:
+        raise ValueError(
+            f"CLI adapter {adapter_name!r} without external client requires --config ember.toml"
+        )
+    ks_backend = getattr(args, "keystore_backend", None) or "file"
     try:
         vault = CustodyVault.open(
             data_dir,
             key_dir=key_dir,
             tenant_id=args.tenant,
             adapter=store,
+            anchor=cli_anchor if cli_anchor is not None else NullAnchor(),
+            encrypt_vendor_payload=bool(getattr(args, "encrypt_vendor_payload", False)),
+            keystore_backend=ks_backend,
         )
     except BaseException:
-        store.close()
+        if closable_store is not None:
+            closable_store.close()
         raise
-    return vault, store
+    return vault, closable_store
+
+
+def _close_vault_pair(vault: CustodyVault, store: Any) -> None:
+    try:
+        vault.close()
+    finally:
+        if store is not None:
+            store.close()
 
 
 def _parse_metadata_pairs(pairs: Sequence[str] | None) -> dict[str, Any]:
@@ -55,30 +120,32 @@ def _cmd_init(args: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "status": "initialized",
-                    "vault_dir": str(Path(args.vault).resolve()),
+                    "vault_dir": str(Path(args.vault).resolve()) if not getattr(args, "config", None) else str(vault.tenant_id),
                     "tenant_id": vault.tenant_id,
                     "public_key_hex": vault.signer.public_key_hex,
                     "keys_separated_from_ledger": vault.keys_separated_from_ledger,
+                    "encrypt_vendor_payload": vault.encrypt_vendor_payload,
                 },
                 indent=2,
             )
         )
         return 0
     finally:
-        vault.close()
-        store.close()
+        _close_vault_pair(vault, store)
 
 
 def _cmd_add_source(args: argparse.Namespace) -> int:
     text = Path(args.file).read_text(encoding="utf-8") if args.file else args.text
     if text is None or not text:
         raise ValueError("provide either --text or --file with non-empty content")
+    span_mode = None if args.span_mode == "none" else args.span_mode
     vault, store = _vault(args)
     try:
         rec, _ = vault.register_source(
             args.source_id,
             text,
             mode=args.mode,
+            span_mode=span_mode,
             origin=args.origin,
             origin_kind=args.origin_kind,
             supplied_by=args.supplied_by,
@@ -86,8 +153,7 @@ def _cmd_add_source(args: argparse.Namespace) -> int:
         print(json.dumps(rec.as_dict(), indent=2))
         return 0
     finally:
-        vault.close()
-        store.close()
+        _close_vault_pair(vault, store)
 
 
 def _cmd_remember(args: argparse.Namespace) -> int:
@@ -117,8 +183,7 @@ def _cmd_remember(args: argparse.Namespace) -> int:
         )
         return 0
     finally:
-        vault.close()
-        store.close()
+        _close_vault_pair(vault, store)
 
 
 def _cmd_search(args: argparse.Namespace) -> int:
@@ -147,8 +212,7 @@ def _cmd_search(args: argparse.Namespace) -> int:
         )
         return 0
     finally:
-        vault.close()
-        store.close()
+        _close_vault_pair(vault, store)
 
 
 def _cmd_erase(args: argparse.Namespace) -> int:
@@ -163,15 +227,37 @@ def _cmd_erase(args: argparse.Namespace) -> int:
         print(json.dumps(cert.as_dict(), indent=2))
         return 0
     finally:
-        vault.close()
-        store.close()
+        _close_vault_pair(vault, store)
+
+
+def _cmd_checkpoint(args: argparse.Namespace) -> int:
+    vault, store = _vault(args)
+    try:
+        ckpt = vault.checkpoint()
+        print(
+            json.dumps(
+                {
+                    "status": "checkpointed",
+                    "tenant_id": ckpt["tenant_id"],
+                    "seq": ckpt["seq"],
+                    "last_event_hash": ckpt["last_event_hash"],
+                    "state_version": ckpt["state_version"],
+                    "created_at": ckpt["created_at"],
+                    "signature": ckpt.get("signature"),
+                },
+                indent=2,
+            )
+        )
+        return 0
+    finally:
+        _close_vault_pair(vault, store)
 
 
 def _cmd_replay(args: argparse.Namespace) -> int:
     vault, store = _vault(args)
     try:
         chain_ok, chain_msg = vault.ledger.verify_chain(vault.tenant_id)
-        replayed = vault.replay()
+        replayed = vault.replay(use_checkpoint=bool(getattr(args, "use_checkpoint", False)))
         events = vault.ledger.events(vault.tenant_id)
         certs = vault.ledger.list_certificates(vault.tenant_id)
         erased_tombstones = sum(1 for item in replayed.items.values() if item.text == ERASED_TOMBSTONE)
@@ -194,8 +280,7 @@ def _cmd_replay(args: argparse.Namespace) -> int:
         )
         return 0 if chain_ok else 1
     finally:
-        vault.close()
-        store.close()
+        _close_vault_pair(vault, store)
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
@@ -218,8 +303,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
         )
         return 0
     finally:
-        vault.close()
-        store.close()
+        _close_vault_pair(vault, store)
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
@@ -284,9 +368,19 @@ def build_parser() -> argparse.ArgumentParser:
         description="Cryptographic custody, redactable Merkle receipts, and verifiable cascade erasure.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--config", default=None, help="Path to ember.toml config file")
     parser.add_argument("--vault", default=".ember", help="Path to ledger/vault data directory")
     parser.add_argument("--key-dir", default=None, help="Optional separate key storage directory")
     parser.add_argument("--tenant", default="default", help="Tenant identifier")
+    parser.add_argument("--adapter", choices=("sqlite", "memory"), default=None, help="Backing store adapter")
+    parser.add_argument("--keystore-backend", choices=("file", "sqlite"), default=None, help="Local KeyStore format")
+    parser.add_argument(
+        "--encrypt-vendor-payload",
+        action="store_true",
+        help="Encrypt text before writing to vendor/adapter store (Mode 2A/2B)",
+    )
+    parser.add_argument("--tsa-url", default=None, help="RFC 3161 Time-Stamp Authority URL for erasure anchoring")
+    parser.add_argument("--rekor-url", default=None, help="Sigstore Rekor URL for erasure anchoring")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -298,6 +392,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_src.add_argument("--text", default=None)
     p_src.add_argument("--file", default=None)
     p_src.add_argument("--mode", choices=("sentence", "line", "whole"), default="sentence")
+    p_src.add_argument("--span-mode", choices=("none", "word", "clause"), default="none")
     p_src.add_argument("--origin", default="")
     p_src.add_argument("--origin-kind", default="unknown")
     p_src.add_argument("--supplied-by", default="")
@@ -326,7 +421,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_erase.add_argument("--marker", action="append", default=None)
     p_erase.set_defaults(func=_cmd_erase)
 
+    p_ckpt = sub.add_parser("checkpoint", help="Write an Ed25519-signed ciphertext-only state checkpoint")
+    p_ckpt.set_defaults(func=_cmd_checkpoint)
+
     p_rep = sub.add_parser("replay", help="Verify hash chain and replay ledger state from zero")
+    p_rep.add_argument("--use-checkpoint", action="store_true", help="Replay from latest verified checkpoint")
     p_rep.set_defaults(func=_cmd_replay)
 
     p_exp = sub.add_parser("export", help="Export offline verification bundle JSON")
@@ -346,8 +445,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
     parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    args = parser.parse_args(raw_argv)
+    args.vault_explicit = any(tok == "--vault" or tok.startswith("--vault=") for tok in raw_argv)
+    args.tenant_explicit = any(tok == "--tenant" or tok.startswith("--tenant=") for tok in raw_argv)
     try:
         return int(args.func(args))
     except (
@@ -357,11 +459,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         IdempotencyConflict,
         InvariantViolation,
         DecryptionError,
+        KmsOperationError,
         FileNotFoundError,
         json.JSONDecodeError,
         UnicodeDecodeError,
         ValueError,
         OSError,
+        ImportError,
+        RuntimeError,
     ) as exc:
         print(json.dumps({"error": type(exc).__name__, "detail": str(exc)}, indent=2), file=sys.stderr)
         return 1

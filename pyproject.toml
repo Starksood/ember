@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ember-custody"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cryptographic custody, redactable Merkle receipts, and verifiable cascade erasure for AI memory and RAG stores."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,7 +40,31 @@ dependencies = [
 
 [project.optional-dependencies]
 mem0 = ["mem0ai>=0.1.0"]
-dev = ["pytest>=8.0", "ruff>=0.6.0"]
+qdrant = ["qdrant-client>=1.9.0"]
+chroma = ["chromadb>=0.5.0"]
+postgres = ["psycopg>=3.1.0"]
+pinecone = ["pinecone>=5.0.0"]
+langchain = ["langchain-core>=0.2.0"]
+llamaindex = ["llama-index-core>=0.10.0"]
+aws = ["boto3>=1.34.0"]
+gcp = ["google-cloud-kms>=2.21.0"]
+server = ["starlette>=0.38.0", "uvicorn>=0.30.0"]
+mcp = ["mcp>=1.0.0"]
+all = [
+  "mem0ai>=0.1.0",
+  "qdrant-client>=1.9.0",
+  "chromadb>=0.5.0",
+  "psycopg>=3.1.0",
+  "pinecone>=5.0.0",
+  "langchain-core>=0.2.0",
+  "llama-index-core>=0.10.0",
+  "boto3>=1.34.0",
+  "google-cloud-kms>=2.21.0",
+  "starlette>=0.38.0",
+  "uvicorn>=0.30.0",
+  "mcp>=1.0.0",
+]
+dev = ["pytest>=8.0", "ruff>=0.6.0", "build>=1.0.0"]
 
 [project.scripts]
 ember = "ember.cli:main"

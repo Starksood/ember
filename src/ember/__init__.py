@@ -3,9 +3,13 @@
 from .adapters import (
     AdapterHit,
     AdapterOp,
+    ChromaAdapter,
     InMemoryStoreAdapter,
     Mem0Adapter,
     MemoryStoreAdapter,
+    PgVectorAdapter,
+    PineconeAdapter,
+    QdrantAdapter,
     SQLiteStoreAdapter,
     VectorStoreAdapter,
 )
@@ -19,9 +23,32 @@ from .audit import (
     run_benchmark,
     verify_suite_hygiene,
 )
+from .config import (
+    EmberConfig,
+    find_ember_config,
+    load_ember_config,
+    open_vault_from_config,
+    parse_ember_config_dict,
+)
 from .crypto import CIPHER_NAME, ERASED_TOMBSTONE, DecryptionError
-from .keystore import FileKeyStore, KeyStore, MemoryKeyStore, ShredReport
-from .ledger import IdempotencyConflict, LedgerIntegrityError, SQLiteLedger
+from .frameworks import (
+    EmberDocument,
+    EmberLangChainRetriever,
+    EmberLangChainVectorStore,
+    EmberLlamaIndexRetriever,
+    EmberMem0,
+    EmberNodeWithScore,
+    EmberTextNode,
+)
+from .keystore import FileKeyStore, KeyStore, MemoryKeyStore, ShredReport, SQLiteKeyStore
+from .kms import (
+    AwsKmsKeyStore,
+    EnvelopeKmsKeyStore,
+    GcpKmsKeyStore,
+    KmsOperationError,
+    VaultTransitKeyStore,
+)
+from .ledger import IdempotencyConflict, LedgerBackend, LedgerIntegrityError, PostgresLedger, SQLiteLedger
 from .merkle import (
     RedactableDoc,
     SpanChunkerFn,
@@ -45,32 +72,55 @@ from .reducer import (
     decrypt_item_metadata,
     decrypt_item_payload,
 )
-from .signing import AnchorReceipt, CallbackAnchor, Ed25519Signer, NullAnchor, TimestampAnchor
-from .vault import CustodyVault, QueryHit, RememberResult, SearchResult, TurnTrace
+from .signing import (
+    AnchorReceipt,
+    CallbackAnchor,
+    Ed25519Signer,
+    NullAnchor,
+    RekorAnchor,
+    Rfc3161Anchor,
+    TimestampAnchor,
+)
+from .vault import AsyncCustodyVault, CustodyVault, QueryHit, RememberResult, SearchResult, TurnTrace
 from .verify import verify_bundle, verify_ed25519_certificate, verify_ledger_chain, verify_redactable_receipt
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "AdapterHit",
     "AdapterOp",
     "AnchorReceipt",
+    "AsyncCustodyVault",
+    "AwsKmsKeyStore",
     "BenchmarkBackendSpec",
     "CIPHER_NAME",
     "CallbackAnchor",
+    "ChromaAdapter",
     "ClosureManifest",
     "CustodyVault",
     "DecryptionError",
     "ERASED_TOMBSTONE",
     "Ed25519Signer",
+    "EmberConfig",
+    "EmberDocument",
+    "EmberLangChainRetriever",
+    "EmberLangChainVectorStore",
+    "EmberLlamaIndexRetriever",
+    "EmberMem0",
+    "EmberNodeWithScore",
     "EmberState",
+    "EmberTextNode",
+    "EnvelopeKmsKeyStore",
     "ErasureCertificate",
     "ErasureIncomplete",
     "FileKeyStore",
+    "GcpKmsKeyStore",
     "IdempotencyConflict",
     "InMemoryStoreAdapter",
     "InvariantViolation",
     "KeyStore",
+    "KmsOperationError",
+    "LedgerBackend",
     "LedgerEvent",
     "LedgerIntegrityError",
     "Mem0Adapter",
@@ -78,11 +128,18 @@ __all__ = [
     "MemoryKeyStore",
     "MemoryStoreAdapter",
     "NullAnchor",
+    "PgVectorAdapter",
+    "PineconeAdapter",
+    "PostgresLedger",
+    "QdrantAdapter",
     "QueryHit",
     "Receipt",
     "RedactableDoc",
     "ReductionError",
+    "RekorAnchor",
     "RememberResult",
+    "Rfc3161Anchor",
+    "SQLiteKeyStore",
     "SQLiteLedger",
     "SQLiteStoreAdapter",
     "SUITE_V2",
@@ -96,20 +153,25 @@ __all__ = [
     "TimestampAnchor",
     "TombstonedSubjectError",
     "TurnTrace",
+    "VaultTransitKeyStore",
     "VectorStoreAdapter",
     "__version__",
     "apply_event",
     "compute_closure",
     "decrypt_item_metadata",
     "decrypt_item_payload",
+    "find_ember_config",
     "in_memory_backend_spec",
     "inclusion_proof",
     "leaf_hash",
+    "load_ember_config",
     "locate_span",
     "mem0_backend_spec",
     "merkle_root",
     "mint_flat_receipt",
     "mint_redactable_receipt",
+    "open_vault_from_config",
+    "parse_ember_config_dict",
     "run_benchmark",
     "split_parts",
     "split_spans_with_offsets",
