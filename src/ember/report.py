@@ -155,6 +155,41 @@ def generate_html_report(
     kind_summary = ", ".join(f"{k}: {v}" for k, v in sorted(kind_counts.items())) or "none"
     tail_hash = str(events[-1].get("event_hash", "")) if events and isinstance(events[-1], Mapping) else "genesis"
 
+    coverage = bundle.get("coverage") if isinstance(bundle.get("coverage"), Mapping) else None
+    coverage_section_html = ""
+    if coverage is not None:
+        cov_verdict = str(coverage.get("verdict", "unknown"))
+        if cov_verdict == "complete":
+            cov_badge = '<span class="badge pass">COMPLETE</span>'
+        elif cov_verdict == "bounded_with_warnings":
+            cov_badge = '<span class="badge warn">BOUNDED WITH WARNINGS</span>'
+        else:
+            cov_badge = f'<span class="badge fail">{_esc(cov_verdict.upper())}</span>'
+        unverified_locs = coverage.get("unverified_locations") or ()
+        orphan_srcs = coverage.get("orphan_source_ids") or ()
+        unattr_items = coverage.get("unattributed_item_ids") or ()
+        recs = coverage.get("recommendations") or ()
+        src_rate = float(coverage.get("source_coverage_rate", 1.0)) * 100.0
+        lin_rate = float(coverage.get("lineage_capture_rate", 1.0)) * 100.0
+        unverified_str = ", ".join(f"<code>{_esc(x)}</code>" for x in unverified_locs) or '<span class="muted">none</span>'
+        orphan_str = ", ".join(f"<code>{_esc(x)}</code>" for x in orphan_srcs) or '<span class="muted">none</span>'
+        unattr_str = ", ".join(f"<code>{_esc(x)}</code>" for x in unattr_items) or '<span class="muted">none</span>'
+        rec_items_html = "".join(f"<li>{_esc(r)}</li>" for r in recs)
+        rec_block = f"<ul>{rec_items_html}</ul>" if rec_items_html else '<div class="muted">No coverage warnings.</div>'
+        coverage_section_html = (
+            "\n  <h2>5. Bounded Erasure Coverage &amp; Lineage Completeness</h2>\n"
+            '  <div class="card">\n'
+            f"    <div>Verdict: {cov_badge} · {_esc(coverage.get('summary', ''))}</div>\n"
+            f'    <div class="meta-line" style="margin-top: 6px;">'
+            f"Source linkage: <strong>{src_rate:.1f}%</strong> ({_esc(coverage.get('sources_linked_count', 0))}/{_esc(coverage.get('source_count', 0))}) · "
+            f"Lineage capture: <strong>{lin_rate:.1f}%</strong> ({_esc(coverage.get('attributed_item_count', 0))}/{_esc(coverage.get('live_item_count', 0))}) · "
+            f"Pending erasures: <strong>{_esc(coverage.get('pending_erasure_count', 0))}</strong>"
+            f"</div>\n"
+            f"    <div><small>Orphan sources: {orphan_str} · Unattributed items: {unattr_str} · Unverified locations: {unverified_str}</small></div>\n"
+            f'    <div style="margin-top: 8px;"><small><strong>Recommendations:</strong></small>{rec_block}</div>\n'
+            "  </div>\n"
+        )
+
     status_banner = (
         '<div class="banner pass">VERIFICATION PASSED — CRYPTOGRAPHIC PROOF INTACT</div>'
         if overall_ok
@@ -256,7 +291,7 @@ def generate_html_report(
     <div>Status: {_badge(ledger_check.get('ok'))} · Detail: {_esc(ledger_check.get('detail', 'not included in bundle'))}</div>
     <div class="meta-line" style="margin-top: 6px;">Events by kind: <code>{_esc(kind_summary)}</code> · Tail hash: <code>{_esc(tail_hash)}</code></div>
   </div>
-
+{coverage_section_html}
   <details>
     <summary>Raw Verification Report JSON</summary>
     <pre>{escaped_json}</pre>

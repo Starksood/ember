@@ -27,7 +27,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from .keystore import KeyStore
 from .merkle import RedactableDoc
-from .records import LedgerEvent, MemoryItem, SourceRecord
+from .records import LedgerEvent, MemoryItem, PendingErasureRecord, SourceRecord
 from .reducer import (
     ConcurrentModificationError,
     EmberState,
@@ -334,6 +334,16 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     last_event_hash TEXT NOT NULL,
     checkpoint_json TEXT NOT NULL,
     PRIMARY KEY (tenant_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS pending_erasures (
+    tenant_id   TEXT NOT NULL,
+    erasure_id  TEXT NOT NULL,
+    subject_id  TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, erasure_id)
 );
 """
 
@@ -711,6 +721,65 @@ class SQLiteLedger:
             ).fetchall()
             return [json.loads(r[0]) for r in rows]
 
+    # ── Durable Pending-Erasure Journal (crash recovery & reconciliation) ─────
+
+    def put_pending_erasure(self, tenant_id: str, record: PendingErasureRecord) -> None:
+        encoded = canonical_bytes(record.as_dict()).decode("utf-8")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO pending_erasures (
+                        tenant_id, erasure_id, subject_id, status, updated_at, record_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(tenant_id, erasure_id) DO UPDATE SET
+                        status = excluded.status,
+                        updated_at = excluded.updated_at,
+                        record_json = excluded.record_json
+                    """,
+                    (
+                        tenant_id,
+                        record.erasure_id,
+                        record.subject_id,
+                        record.status,
+                        record.updated_at,
+                        encoded,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def get_pending_erasure(self, tenant_id: str, erasure_id: str) -> PendingErasureRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT record_json FROM pending_erasures WHERE tenant_id = ? AND erasure_id = ?",
+                (tenant_id, erasure_id),
+            ).fetchone()
+            return PendingErasureRecord.from_dict(json.loads(row[0])) if row is not None else None
+
+    def list_pending_erasures(
+        self,
+        tenant_id: str = "default",
+        *,
+        include_completed: bool = False,
+    ) -> list[PendingErasureRecord]:
+        with self._lock:
+            if include_completed:
+                rows = self._conn.execute(
+                    "SELECT record_json FROM pending_erasures WHERE tenant_id = ? ORDER BY rowid ASC",
+                    (tenant_id,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT record_json FROM pending_erasures WHERE tenant_id = ? AND status != 'completed' "
+                    "ORDER BY rowid ASC",
+                    (tenant_id,),
+                ).fetchall()
+            return [PendingErasureRecord.from_dict(json.loads(r[0])) for r in rows]
+
 
 def _open_pg_connection(dsn: str) -> Any:
     try:
@@ -760,6 +829,7 @@ class PostgresLedger:
         self._tbl_docs = p + "documents"
         self._tbl_certs = p + "certificates"
         self._tbl_ckpts = p + "checkpoints"
+        self._tbl_pending = p + "pending_erasures"
         self._init_schema()
 
     def _exec(self, cur: Any, sql_template: str, params: Sequence[Any] = ()) -> Any:
@@ -768,6 +838,7 @@ class PostgresLedger:
             .replace("__DOCS__", self._tbl_docs)
             .replace("__CERTS__", self._tbl_certs)
             .replace("__CKPTS__", self._tbl_ckpts)
+            .replace("__PENDING__", self._tbl_pending)
         )
         if params:
             cur.execute(sql, tuple(params))
@@ -841,6 +912,17 @@ class PostgresLedger:
                 last_event_hash TEXT NOT NULL,
                 checkpoint_json TEXT NOT NULL,
                 PRIMARY KEY (tenant_id, seq)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS __PENDING__ (
+                tenant_id   TEXT NOT NULL,
+                erasure_id  TEXT NOT NULL,
+                subject_id  TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, erasure_id)
             )
             """,
         )
@@ -1214,6 +1296,69 @@ class PostgresLedger:
                     (tenant_id,),
                 )
                 return [json.loads(r[0]) for r in cur.fetchall()]
+            finally:
+                if hasattr(cur, "close"):
+                    cur.close()
+
+    def put_pending_erasure(self, tenant_id: str, record: PendingErasureRecord) -> None:
+        encoded = canonical_bytes(record.as_dict()).decode("utf-8")
+
+        def _op(cur: Any) -> None:
+            self._exec(
+                cur,
+                "INSERT INTO __PENDING__ (tenant_id, erasure_id, subject_id, status, updated_at, record_json) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT(tenant_id, erasure_id) DO UPDATE SET "
+                "status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, record_json = EXCLUDED.record_json",
+                (
+                    tenant_id,
+                    record.erasure_id,
+                    record.subject_id,
+                    record.status,
+                    record.updated_at,
+                    encoded,
+                ),
+            )
+
+        self._run_tx(_op)
+
+    def get_pending_erasure(self, tenant_id: str, erasure_id: str) -> PendingErasureRecord | None:
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                self._exec(
+                    cur,
+                    "SELECT record_json FROM __PENDING__ WHERE tenant_id = %s AND erasure_id = %s",
+                    (tenant_id, erasure_id),
+                )
+                row = cur.fetchone()
+                return PendingErasureRecord.from_dict(json.loads(row[0])) if row is not None else None
+            finally:
+                if hasattr(cur, "close"):
+                    cur.close()
+
+    def list_pending_erasures(
+        self,
+        tenant_id: str = "default",
+        *,
+        include_completed: bool = False,
+    ) -> list[PendingErasureRecord]:
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                if include_completed:
+                    self._exec(
+                        cur,
+                        "SELECT record_json FROM __PENDING__ WHERE tenant_id = %s",
+                        (tenant_id,),
+                    )
+                else:
+                    self._exec(
+                        cur,
+                        "SELECT record_json FROM __PENDING__ WHERE tenant_id = %s AND status != %s",
+                        (tenant_id, "completed"),
+                    )
+                return [PendingErasureRecord.from_dict(json.loads(r[0])) for r in cur.fetchall()]
             finally:
                 if hasattr(cur, "close"):
                     cur.close()

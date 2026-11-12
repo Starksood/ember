@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import threading
 from typing import Any
+import unicodedata
 import uuid
 
 from .adapters import (
@@ -26,6 +27,7 @@ from .adapters import (
     _content_tokens,
     _tokenize,
 )
+from .coverage import CoverageReport, analyze_coverage
 from .crypto import CIPHER_NAME, ERASED_TOMBSTONE, build_aad, encrypt_text
 from .keystore import FileKeyStore, KeyStore, MemoryKeyStore, SQLiteKeyStore
 from .ledger import (
@@ -37,7 +39,15 @@ from .ledger import (
 )
 from .merkle import ChunkMode, ChunkerFn, RedactableDoc, SpanChunkerFn, SpanMode, _entry_text
 from .receipts import Receipt, mint_redactable_receipt
-from .records import ClosureManifest, ErasureCertificate, LedgerEvent, MemoryItem, SourceRecord
+from .records import (
+    ClosureManifest,
+    ErasureCertificate,
+    LedgerEvent,
+    MemoryItem,
+    PendingErasureRecord,
+    ReconcileReport,
+    SourceRecord,
+)
 from .reducer import (
     ConcurrentModificationError,
     EmberState,
@@ -109,7 +119,8 @@ def _extract_content_candidates(
         sources.append(quote)
     sources.extend(_scalar_metadata_strings(metadata))
 
-    for src in sources:
+    for raw_src in sources:
+        src = unicodedata.normalize("NFKC", raw_src)
         norm_full = " ".join(src.strip().lower().split())
         if norm_full:
             candidates.add(norm_full)
@@ -365,6 +376,8 @@ class CustodyVault:
         embedder: Any = None,
         auto_checkpoint_every: int | None = None,
         use_checkpoint: bool = True,
+        auto_reconcile: bool = False,
+        unverified_locations: Iterable[str] = (),
     ) -> None:
         if not isinstance(tenant_id, str) or not tenant_id.strip():
             raise ValueError("tenant_id must be a non-empty string")
@@ -391,6 +404,10 @@ class CustodyVault:
         self._embed_fn = _resolve_embed_fn(embedder)
         self.auto_checkpoint_every = auto_checkpoint_every
         self._ops_since_checkpoint = 0
+        self._declared_unverified_locations: tuple[str, ...] = tuple(
+            dict.fromkeys(str(x).strip() for x in unverified_locations if str(x).strip())
+        )
+        self._traced_item_ids: set[str] = set()
         append_sig = inspect.signature(self.ledger.append)
         append_params = set(append_sig.parameters)
         append_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in append_sig.parameters.values())
@@ -406,6 +423,8 @@ class CustodyVault:
             self._last_event_hash = GENESIS_HASH
             self._sync_state_from_ledger()
         self._sync_adapter_scopes()
+        if auto_reconcile:
+            self.reconcile_erasures()
 
     def _replay_state(self, *, keystore: KeyStore | None, use_checkpoint: bool) -> EmberState:
         sig = inspect.signature(self.ledger.replay)
@@ -565,6 +584,8 @@ class CustodyVault:
         keystore_backend: str = "file",
         auto_checkpoint_every: int | None = None,
         use_checkpoint: bool = True,
+        auto_reconcile: bool = False,
+        unverified_locations: Iterable[str] = (),
     ) -> "CustodyVault":
         """Open or create a persistent vault on disk (or plug custom `LedgerBackend` / `KeyStore`).
 
@@ -617,6 +638,8 @@ class CustodyVault:
                 embedder=embedder,
                 auto_checkpoint_every=auto_checkpoint_every,
                 use_checkpoint=use_checkpoint,
+                auto_reconcile=auto_reconcile,
+                unverified_locations=unverified_locations,
             )
             vault._owns_keystore = owns_keystore
             return vault
@@ -641,6 +664,8 @@ class CustodyVault:
         embedder: Any = None,
         auto_checkpoint_every: int | None = None,
         use_checkpoint: bool = True,
+        auto_reconcile: bool = False,
+        unverified_locations: Iterable[str] = (),
     ) -> "CustodyVault":
         """Open a clean in-memory vault for fast tests, notebooks, and demos."""
         ledger = SQLiteLedger(":memory:")
@@ -657,6 +682,8 @@ class CustodyVault:
                 embedder=embedder,
                 auto_checkpoint_every=auto_checkpoint_every,
                 use_checkpoint=use_checkpoint,
+                auto_reconcile=auto_reconcile,
+                unverified_locations=unverified_locations,
             )
         except BaseException:
             ledger.close()
@@ -845,10 +872,13 @@ class CustodyVault:
             raise ValueError("source_id must be a non-empty string")
 
         explicit_derived = [str(d) for d in derived_from if str(d).strip()]
+        used_trace_reads = False
         trace = self._active_trace()
         if auto_derive and trace is not None:
             traced_reads = trace.select_citations(text)
-            explicit_derived = [*traced_reads, *explicit_derived]
+            if traced_reads:
+                used_trace_reads = True
+                explicit_derived = [*traced_reads, *explicit_derived]
         derived_tuple = tuple(dict.fromkeys(explicit_derived))
         alias_tuple = tuple(dict.fromkeys(str(a) for a in aliases if str(a).strip()))
 
@@ -1134,6 +1164,8 @@ class CustodyVault:
             self.state = next_state
             self._last_event_hash = ev.event_hash
             self._maybe_auto_checkpoint()
+            if used_trace_reads:
+                self._traced_item_ids.add(resolved_item_id)
             if trace is not None:
                 trace.record_write(resolved_item_id)
             return RememberResult(
@@ -1337,6 +1369,215 @@ class CustodyVault:
                 leaking.append(probe)
         return leaking
 
+    def _put_pending_record(self, rec: PendingErasureRecord) -> None:
+        put_fn = getattr(self.ledger, "put_pending_erasure", None)
+        if callable(put_fn):
+            put_fn(self.tenant_id, rec)
+
+    def _get_pending_record(self, erasure_id: str) -> PendingErasureRecord | None:
+        get_fn = getattr(self.ledger, "get_pending_erasure", None)
+        if callable(get_fn):
+            return get_fn(self.tenant_id, erasure_id)
+        return None
+
+    def _list_journal_entries(self, *, include_completed: bool = False) -> list[PendingErasureRecord]:
+        list_fn = getattr(self.ledger, "list_pending_erasures", None)
+        if callable(list_fn):
+            return list(list_fn(self.tenant_id, include_completed=include_completed))
+        return []
+
+    def pending_erasures(self) -> list[PendingErasureRecord]:
+        """List active (`pending`/`failed`) journal entries plus any uncertified `ERASE_SUBJECT` events."""
+        with self._lock:
+            self._sync_state_from_ledger()
+            journal_entries = self._list_journal_entries(include_completed=False)
+            covered_tokens: set[str] = set()
+            for entry in journal_entries:
+                covered_tokens.update(entry.subject_tokens)
+                if not entry.subject_tokens and entry.subject_id:
+                    covered_tokens.add(self.keystore.tombstone_token(entry.subject_id))
+
+            events = self.ledger.events(self.tenant_id)
+            seq_by_hash = {ev.event_hash: ev.seq for ev in events}
+            certs = self.ledger.list_certificates(self.tenant_id)
+            cert_ranges: list[tuple[set[str], int]] = []
+            for cert in certs:
+                c_tokens = {str(t) for t in (cert.get("subject_tokens") or ()) if t}
+                c_seq = seq_by_hash.get(str(cert.get("ledger_tail_hash", "")), -1)
+                if c_tokens:
+                    cert_ranges.append((c_tokens, c_seq))
+
+            synthesized: list[PendingErasureRecord] = []
+            for ev in events:
+                if ev.kind != "ERASE_SUBJECT":
+                    continue
+                ev_tokens = {str(t) for t in (ev.payload.get("subject_tokens") or ()) if t}
+                if not ev_tokens:
+                    continue
+                if ev_tokens & covered_tokens:
+                    continue
+                has_cert = any((c_tokens & ev_tokens) and c_seq >= ev.seq for c_tokens, c_seq in cert_ranges)
+                if has_cert:
+                    continue
+                closure = dict(ev.payload.get("closure") or {})
+                sid = str(closure.get("subject_id") or f"subject_seq_{ev.seq}")
+                synthesized.append(
+                    PendingErasureRecord(
+                        erasure_id=f"ev_{ev.seq}_{ev.event_hash[7:15]}",
+                        tenant_id=self.tenant_id,
+                        subject_id=sid,
+                        status="pending",
+                        closure=closure,
+                        created_at=ev.committed_at,
+                        updated_at=ev.committed_at,
+                        subject_tokens=tuple(sorted(ev_tokens)),
+                    )
+                )
+                covered_tokens.update(ev_tokens)
+
+            return [*journal_entries, *synthesized]
+
+    def _build_coverage_report(
+        self,
+        subject_id: str | None = None,
+        *,
+        unverified_locations: Iterable[str] = (),
+        exclude_erasure_tokens: set[str] | None = None,
+    ) -> CoverageReport:
+        chain_ok, _ = self.ledger.verify_chain(self.tenant_id)
+        events = self.ledger.events(self.tenant_id)
+
+        adapter_name = type(self.adapter).__name__
+        store_entry: dict[str, Any] = {
+            "name": adapter_name,
+            "type": "memory_store",
+            "reachable": True,
+            "encrypt_vendor_payload": self.encrypt_vendor_payload,
+        }
+        try:
+            self.adapter.search("__ember_healthcheck__", limit=1)
+        except Exception as exc:
+            store_entry["reachable"] = False
+            store_entry["error"] = f"{type(exc).__name__}: {exc}"
+
+        verified_stores = [
+            store_entry,
+            {
+                "name": type(self.ledger).__name__,
+                "type": "ledger_and_documents",
+                "reachable": True,
+            },
+        ]
+
+        unverified: list[str] = list(self._declared_unverified_locations)
+        for loc in unverified_locations:
+            s_loc = str(loc).strip()
+            if s_loc and s_loc not in unverified:
+                unverified.append(s_loc)
+        if not self.keys_separated_from_ledger:
+            unverified.append("colocated_keystore_and_ledger")
+        if isinstance(self.adapter, Mem0Adapter) and not self.encrypt_vendor_payload:
+            unverified.append("mem0_internal_history_db")
+
+        pending_all = self.pending_erasures()
+        if exclude_erasure_tokens:
+            pending_filtered = [
+                p
+                for p in pending_all
+                if not (set(p.subject_tokens) & exclude_erasure_tokens)
+            ]
+        else:
+            pending_filtered = pending_all
+
+        if pending_filtered:
+            unverified.append("pending_erasure_reconciliation")
+
+        subj_tokens: tuple[str, ...] = ()
+        subj_certs = 0
+        subj_tombstoned = False
+        if subject_id is not None:
+            tok = self.keystore.tombstone_token(subject_id)
+            subj_tokens = (tok,) if tok else ()
+            t_set = set(subj_tokens)
+            for cert in self.ledger.list_certificates(self.tenant_id):
+                c_tokens = {str(t) for t in (cert.get("subject_tokens") or ())}
+                if cert.get("subject_id") == subject_id or (c_tokens & t_set):
+                    subj_certs += 1
+            subj_tombstoned = bool(t_set & self.state.tombstoned_tokens)
+
+        return analyze_coverage(
+            tenant_id=self.tenant_id,
+            state=self.state,
+            events=events,
+            ledger_chain_ok=chain_ok,
+            verified_stores=verified_stores,
+            unverified_locations=unverified,
+            pending_erasures=[p.safe_summary() for p in pending_filtered],
+            traced_item_ids=self._traced_item_ids,
+            subject_id=subject_id,
+            subject_tokens=subj_tokens,
+            subject_certificates_count=subj_certs,
+            subject_tombstoned=subj_tombstoned,
+        )
+
+    def audit_coverage(
+        self,
+        subject_id: str | None = None,
+        *,
+        unverified_locations: Iterable[str] = (),
+    ) -> CoverageReport:
+        """Audit live source/lineage completeness, pending erasures, and structural trust gaps."""
+        with self._lock:
+            self._sync_state_from_ledger()
+            return self._build_coverage_report(
+                subject_id=subject_id,
+                unverified_locations=unverified_locations,
+            )
+
+    def reconcile_erasures(self) -> ReconcileReport:
+        """Retry any interrupted `pending`/`failed` erasures until vendor deletion and certification succeed."""
+        with self._lock:
+            self._sync_state_from_ledger()
+            entries = self.pending_erasures()
+            attempted = 0
+            completed_ids: list[str] = []
+            still_failing: list[dict[str, str]] = []
+            certificates: list[ErasureCertificate] = []
+            processed_tokens: set[str] = set()
+
+            for entry in entries:
+                e_tokens = set(entry.subject_tokens)
+                if e_tokens and (e_tokens & processed_tokens):
+                    continue
+                attempted += 1
+                try:
+                    cert = self.erase(
+                        entry.subject_id,
+                        aliases=entry.aliases,
+                        probes=entry.probes,
+                        markers=entry.markers,
+                        block_identifiers=entry.block_identifiers,
+                        auto_probes=True,
+                        _erasure_id=entry.erasure_id,
+                    )
+                    completed_ids.append(entry.erasure_id)
+                    certificates.append(cert)
+                    processed_tokens.update(e_tokens)
+                except Exception as exc:
+                    still_failing.append(
+                        {
+                            "erasure_id": entry.erasure_id,
+                            "subject_id": entry.subject_id,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+            return ReconcileReport(
+                attempted=attempted,
+                completed_ids=tuple(completed_ids),
+                still_failing=tuple(still_failing),
+                certificates=tuple(certificates),
+            )
+
     def erase(
         self,
         subject_id: str,
@@ -1349,6 +1590,7 @@ class CustodyVault:
         span_predicate: Callable[[str], bool] | None = None,
         auto_probes: bool = True,
         committed_at: str | None = None,
+        _erasure_id: str | None = None,
     ) -> ErasureCertificate:
         """Execute irreversible cascade erasure, key shredding, doc redaction, and probe certification."""
         if not isinstance(subject_id, str) or not subject_id.strip():
@@ -1356,6 +1598,7 @@ class CustodyVault:
         alias_list = [str(a) for a in aliases if str(a).strip()]
         probe_list = [str(p) for p in probes if str(p).strip()]
         marker_list = list(dict.fromkeys([subject_id, *alias_list, *(str(m) for m in markers if str(m).strip())]))
+        explicit_block_ids = [str(b) for b in block_identifiers if str(b).strip()]
 
         with self._lock:
             subject_tokens = tuple(
@@ -1370,7 +1613,7 @@ class CustodyVault:
             token_set = set(subject_tokens)
 
             id_candidates = [val for val in (subject_id, *alias_list) if _is_auto_block_identifier(val)]
-            id_candidates.extend(str(b) for b in block_identifiers if str(b).strip())
+            id_candidates.extend(explicit_block_ids)
             content_tokens = tuple(
                 sorted(
                     {
@@ -1498,176 +1741,269 @@ class CustodyVault:
             self.state = next_state
             self._last_event_hash = ev.event_hash
 
-            # 1. Local irreversible leaf/span redaction in DocumentStore FIRST (survives transient external failures)
-            merged_source_leaves: dict[str, set[int]] = {k: set(v) for k, v in prior_source_leaves.items()}
-            for sid, leaf_indices in closure.source_leaves_redacted.items():
-                merged_source_leaves.setdefault(sid, set()).update(leaf_indices)
+            # Persist durable pending-erasure journal entry BEFORE any fallible external calls
+            existing_pending = self._get_pending_record(_erasure_id) if _erasure_id else None
+            active_erasure_id = _erasure_id or f"era_{ev.event_hash[7:19]}_{uuid.uuid4().hex[:6]}"
+            j_now = _utc_now()
+            active_journal = PendingErasureRecord(
+                erasure_id=active_erasure_id,
+                tenant_id=self.tenant_id,
+                subject_id=subject_id,
+                status="pending",
+                closure=closure.as_dict(),
+                aliases=tuple(alias_list),
+                probes=tuple(effective_probes),
+                markers=tuple(marker_list),
+                block_identifiers=tuple(explicit_block_ids),
+                attempts=(existing_pending.attempts + 1) if existing_pending is not None else 1,
+                last_error=None,
+                created_at=existing_pending.created_at if existing_pending is not None else j_now,
+                updated_at=j_now,
+                completed_at=None,
+                certificate_id=None,
+                subject_tokens=subject_tokens,
+            )
+            self._put_pending_record(active_journal)
 
-            merged_source_spans: dict[str, dict[int, set[int]]] = {
-                sid: {l_idx: set(s_idxs) for l_idx, s_idxs in l_map.items()}
-                for sid, l_map in prior_source_spans.items()
-            }
-            for sid, l_map in closure.source_spans_redacted.items():
-                target_sid = merged_source_spans.setdefault(sid, {})
-                for l_idx, s_idxs in l_map.items():
-                    target_sid.setdefault(int(l_idx), set()).update(int(i) for i in s_idxs)
+            try:
+                # 1. Local irreversible leaf/span redaction in DocumentStore FIRST (survives transient external failures)
+                merged_source_leaves: dict[str, set[int]] = {k: set(v) for k, v in prior_source_leaves.items()}
+                for sid, leaf_indices in closure.source_leaves_redacted.items():
+                    merged_source_leaves.setdefault(sid, set()).update(leaf_indices)
 
-            for sid in sorted(set(merged_source_leaves) | set(merged_source_spans)):
-                doc = self.ledger.get_document(self.tenant_id, sid)
-                if doc is None:
-                    continue
-                updated_doc = doc
-                whole = merged_source_leaves.get(sid)
-                if whole:
-                    updated_doc = updated_doc.redact_indices(whole)
-                sp_map = merged_source_spans.get(sid)
-                if sp_map:
-                    updated_doc = updated_doc.redact_leaf_spans(sp_map)
+                merged_source_spans: dict[str, dict[int, set[int]]] = {
+                    sid: {l_idx: set(s_idxs) for l_idx, s_idxs in l_map.items()}
+                    for sid, l_map in prior_source_spans.items()
+                }
+                for sid, l_map in closure.source_spans_redacted.items():
+                    target_sid = merged_source_spans.setdefault(sid, {})
+                    for l_idx, s_idxs in l_map.items():
+                        target_sid.setdefault(int(l_idx), set()).update(int(i) for i in s_idxs)
+
+                for sid in sorted(set(merged_source_leaves) | set(merged_source_spans)):
+                    doc = self.ledger.get_document(self.tenant_id, sid)
+                    if doc is None:
+                        continue
+                    updated_doc = doc
+                    whole = merged_source_leaves.get(sid)
                     if whole:
-                        for l_idx in whole:
-                            sp_map.pop(l_idx, None)
-                    if not sp_map:
-                        merged_source_spans.pop(sid, None)
-                if updated_doc is not doc:
-                    self.ledger.put_document(self.tenant_id, updated_doc)
+                        updated_doc = updated_doc.redact_indices(whole)
+                    sp_map = merged_source_spans.get(sid)
+                    if sp_map:
+                        updated_doc = updated_doc.redact_leaf_spans(sp_map)
+                        if whole:
+                            for l_idx in whole:
+                                sp_map.pop(l_idx, None)
+                        if not sp_map:
+                            merged_source_spans.pop(sid, None)
+                    if updated_doc is not doc:
+                        self.ledger.put_document(self.tenant_id, updated_doc)
 
-            # 2. Local irreversible AES-256-GCM key shredding BEFORE external network calls!
-            targets_to_shred = list(dict.fromkeys([subject_id, *alias_list]))
-            key_destroyed = False
-            record_keys_destroyed = 0
-            for target in targets_to_shred:
-                rep_direct = self.keystore.shred_subject(target)
-                rep_ref = self.keystore.shred_subject(self.keystore.subject_ref(target))
-                key_destroyed = key_destroyed or rep_direct.subject_key_destroyed or rep_ref.subject_key_destroyed
-                record_keys_destroyed += rep_direct.record_keys_destroyed + rep_ref.record_keys_destroyed
-            destroyed_at = _utc_now()
+                # 2. Local irreversible AES-256-GCM key shredding BEFORE external network calls!
+                targets_to_shred = list(dict.fromkeys([subject_id, *alias_list]))
+                key_destroyed = False
+                record_keys_destroyed = 0
+                for target in targets_to_shred:
+                    rep_direct = self.keystore.shred_subject(target)
+                    rep_ref = self.keystore.shred_subject(self.keystore.subject_ref(target))
+                    key_destroyed = key_destroyed or rep_direct.subject_key_destroyed or rep_ref.subject_key_destroyed
+                    record_keys_destroyed += rep_direct.record_keys_destroyed + rep_ref.record_keys_destroyed
+                destroyed_at = _utc_now()
 
-            # Check prior interrupted erase cycles so retries report key destruction accurately when keys are gone
-            all_target_keys_absent = all(
-                self.keystore.get_subject_key(k) is None
-                for target in targets_to_shred
-                for k in (target, self.keystore.subject_ref(target))
-            )
-            prior_records_shredded = all(
-                self.keystore.get_record_key(rid) is None for rid in prior_item_ids
-            )
-            if prior_erase_found and prior_item_ids and all_target_keys_absent and prior_records_shredded:
-                key_destroyed = True
+                # Check prior interrupted erase cycles so retries report key destruction accurately when keys are gone
+                all_target_keys_absent = all(
+                    self.keystore.get_subject_key(k) is None
+                    for target in targets_to_shred
+                    for k in (target, self.keystore.subject_ref(target))
+                )
+                prior_records_shredded = all(
+                    self.keystore.get_record_key(rid) is None for rid in prior_item_ids
+                )
+                if prior_erase_found and prior_item_ids and all_target_keys_absent and prior_records_shredded:
+                    key_destroyed = True
 
-            # 3. External store cascade deletion (safe to fail/retry cleanly without leaving keys alive!)
-            merged_adapter_ids = tuple(dict.fromkeys([*prior_adapter_ids, *closure.adapter_record_ids]))
-            if merged_adapter_ids:
-                self.adapter.delete(merged_adapter_ids)
+                # 3. External store cascade deletion (safe to fail/retry cleanly without leaving keys alive!)
+                merged_adapter_ids = tuple(dict.fromkeys([*prior_adapter_ids, *closure.adapter_record_ids]))
+                if merged_adapter_ids:
+                    self.adapter.delete(merged_adapter_ids)
 
-            # Ensure scope-aware stores (such as Mem0 2.x) probe target subject/alias scopes even on cold retry.
-            register_scope = getattr(self.adapter, "register_scope", None)
-            if callable(register_scope):
-                for target in (subject_id, *alias_list):
-                    scope_uid = self.keystore.subject_ref(target) if self.encrypt_vendor_payload else target
-                    register_scope(user_id=scope_uid)
+                # Ensure scope-aware stores (such as Mem0 2.x) probe target subject/alias scopes even on cold retry.
+                register_scope = getattr(self.adapter, "register_scope", None)
+                if callable(register_scope):
+                    for target in (subject_id, *alias_list):
+                        scope_uid = self.keystore.subject_ref(target) if self.encrypt_vendor_payload else target
+                        register_scope(user_id=scope_uid)
 
-            merged_item_ids = tuple(sorted(set(prior_item_ids) | set(closure.item_ids)))
-            merged_derived_ids = tuple(sorted(set(prior_derived_ids) | set(closure.derived_invalidated)))
-            effective_closure: dict[str, Any] = {
-                "subject_id": subject_id,
-                "item_ids": list(merged_item_ids),
-                "derived_invalidated": list(merged_derived_ids),
-                "source_leaves_redacted": {k: sorted(v) for k, v in sorted(merged_source_leaves.items())},
-                "adapter_record_ids": list(merged_adapter_ids),
-            }
-            if merged_source_spans:
-                effective_closure["source_spans_redacted"] = {
-                    sid: {str(l_idx): sorted(s_idxs) for l_idx, s_idxs in sorted(l_map.items())}
-                    for sid, l_map in sorted(merged_source_spans.items())
+                merged_item_ids = tuple(sorted(set(prior_item_ids) | set(closure.item_ids)))
+                merged_derived_ids = tuple(sorted(set(prior_derived_ids) | set(closure.derived_invalidated)))
+                effective_closure: dict[str, Any] = {
+                    "subject_id": subject_id,
+                    "item_ids": list(merged_item_ids),
+                    "derived_invalidated": list(merged_derived_ids),
+                    "source_leaves_redacted": {k: sorted(v) for k, v in sorted(merged_source_leaves.items())},
+                    "adapter_record_ids": list(merged_adapter_ids),
+                }
+                if merged_source_spans:
+                    effective_closure["source_spans_redacted"] = {
+                        sid: {str(l_idx): sorted(s_idxs) for l_idx, s_idxs in sorted(l_map.items())}
+                        for sid, l_map in sorted(merged_source_spans.items())
+                    }
+
+                # 4. Verify probes against raw backing store & surviving state BEFORE issuing certificate
+                leaking = self._probe_raw_leaks(
+                    subject_id,
+                    alias_list,
+                    set(merged_item_ids),
+                    set(merged_adapter_ids),
+                    effective_probes,
+                    marker_list,
+                )
+                if leaking:
+                    raise ErasureIncomplete(subject_id, leaking, closure)
+
+                after_hash = self.state.digest()
+                issued_at = _utc_now()
+                cert_id = f"cert_{uuid.uuid4().hex[:12]}"
+
+                anchor_digest = sha256_prefixed(
+                    json.dumps(
+                        {
+                            "certificate_id": cert_id,
+                            "before": before_hash,
+                            "after": after_hash,
+                            "tail": ev.event_hash,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                anchor_receipt = self.anchor.anchor(anchor_digest)
+
+                cov = self._build_coverage_report(
+                    subject_id=subject_id,
+                    exclude_erasure_tokens=token_set,
+                )
+
+                trust_boundary = {
+                    "adversary_checkable_signature": True,
+                    "externally_timestamped": anchor_receipt.scheme != "none",
+                    "keys_separated_from_ledger": self.keys_separated_from_ledger,
+                    "live_store_covered": True,
+                    "pre_erasure_backups_covered": False,
+                    "vendor_payload_encrypted": self.encrypt_vendor_payload,
+                    "coverage": {
+                        "verdict": cov.verdict,
+                        "erasure_certifiable": cov.erasure_certifiable,
+                        "source_coverage_rate": round(cov.source_coverage_rate, 4),
+                        "lineage_capture_rate": round(cov.lineage_capture_rate, 4),
+                        "orphan_source_count": len(cov.orphan_source_ids),
+                        "unattributed_item_count": cov.unattributed_item_count,
+                        "unverified_locations": list(cov.unverified_locations),
+                    },
+                    "notes": (
+                        "Certifies live projection closure, backing adapter ID deletion, salted Merkle leaf/span redaction, "
+                        "and AES-256-GCM key shredding on this store. Backups created prior to erasure that copied "
+                        "unseparated keys remain outside technical coverage."
+                    ),
                 }
 
-            # 4. Verify probes against raw backing store & surviving state BEFORE issuing certificate
-            leaking = self._probe_raw_leaks(
-                subject_id,
-                alias_list,
-                set(merged_item_ids),
-                set(merged_adapter_ids),
-                effective_probes,
-                marker_list,
-            )
-            if leaking:
-                raise ErasureIncomplete(subject_id, leaking, closure)
+                unsigned = {
+                    "certificate_id": cert_id,
+                    "tenant_id": self.tenant_id,
+                    "subject_id": subject_id,
+                    "subject_tokens": list(subject_tokens),
+                    "state_hash_before": before_hash,
+                    "state_hash_after": after_hash,
+                    "ledger_tail_hash": ev.event_hash,
+                    "closure": effective_closure,
+                    "probe_count": len(effective_probes),
+                    "battery_all_abstained": True,
+                    "cipher": CIPHER_NAME,
+                    "key_destroyed": key_destroyed or record_keys_destroyed > 0,
+                    "record_keys_destroyed": record_keys_destroyed,
+                    "key_destroyed_at": destroyed_at,
+                    "issued_at": issued_at,
+                    "trust_boundary": trust_boundary,
+                    "anchor": anchor_receipt.as_dict(),
+                }
+                signed_dict = sign_certificate_dict(unsigned, self.signer)
+                cert = ErasureCertificate(
+                    certificate_id=signed_dict["certificate_id"],
+                    tenant_id=signed_dict["tenant_id"],
+                    subject_id=signed_dict["subject_id"],
+                    subject_tokens=tuple(signed_dict["subject_tokens"]),
+                    state_hash_before=signed_dict["state_hash_before"],
+                    state_hash_after=signed_dict["state_hash_after"],
+                    ledger_tail_hash=signed_dict["ledger_tail_hash"],
+                    closure=signed_dict["closure"],
+                    probe_count=signed_dict["probe_count"],
+                    battery_all_abstained=signed_dict["battery_all_abstained"],
+                    cipher=signed_dict["cipher"],
+                    key_destroyed=signed_dict["key_destroyed"],
+                    record_keys_destroyed=signed_dict["record_keys_destroyed"],
+                    key_destroyed_at=signed_dict["key_destroyed_at"],
+                    issued_at=signed_dict["issued_at"],
+                    trust_boundary=signed_dict["trust_boundary"],
+                    anchor=signed_dict["anchor"],
+                    signer_scheme=signed_dict["signer_scheme"],
+                    public_key=signed_dict["public_key"],
+                    signature=signed_dict["signature"],
+                )
+                self.ledger.put_certificate(cert.as_dict())
+            except BaseException as exc:
+                self._put_pending_record(
+                    PendingErasureRecord(
+                        erasure_id=active_journal.erasure_id,
+                        tenant_id=active_journal.tenant_id,
+                        subject_id=active_journal.subject_id,
+                        status="failed",
+                        closure=active_journal.closure,
+                        aliases=active_journal.aliases,
+                        probes=active_journal.probes,
+                        markers=active_journal.markers,
+                        block_identifiers=active_journal.block_identifiers,
+                        attempts=active_journal.attempts,
+                        last_error=f"{type(exc).__name__}: {exc}",
+                        created_at=active_journal.created_at,
+                        updated_at=_utc_now(),
+                        completed_at=None,
+                        certificate_id=None,
+                        subject_tokens=active_journal.subject_tokens,
+                    )
+                )
+                raise
 
-            after_hash = self.state.digest()
-            issued_at = _utc_now()
-            cert_id = f"cert_{uuid.uuid4().hex[:12]}"
+            # Mark this erasure AND any earlier pending/failed attempts for the same subject tokens completed,
+            # scrubbing plaintext probes/markers/aliases from completed journal rows.
+            done_at = cert.issued_at
+            completed_rows: list[PendingErasureRecord] = [active_journal]
+            for prev_row in self._list_journal_entries(include_completed=False):
+                if prev_row.erasure_id == active_journal.erasure_id:
+                    continue
+                if (set(prev_row.subject_tokens) & token_set) or prev_row.subject_id == subject_id:
+                    completed_rows.append(prev_row)
+            for row in completed_rows:
+                self._put_pending_record(
+                    PendingErasureRecord(
+                        erasure_id=row.erasure_id,
+                        tenant_id=row.tenant_id,
+                        subject_id=row.subject_id,
+                        status="completed",
+                        closure=effective_closure if row.erasure_id == active_journal.erasure_id else row.closure,
+                        aliases=(),
+                        probes=(),
+                        markers=(),
+                        block_identifiers=(),
+                        attempts=row.attempts,
+                        last_error=None,
+                        created_at=row.created_at,
+                        updated_at=done_at,
+                        completed_at=done_at,
+                        certificate_id=cert.certificate_id,
+                        subject_tokens=row.subject_tokens,
+                    )
+                )
 
-            anchor_digest = sha256_prefixed(
-                json.dumps(
-                    {
-                        "certificate_id": cert_id,
-                        "before": before_hash,
-                        "after": after_hash,
-                        "tail": ev.event_hash,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            )
-            anchor_receipt = self.anchor.anchor(anchor_digest)
-
-            trust_boundary = {
-                "adversary_checkable_signature": True,
-                "externally_timestamped": anchor_receipt.scheme != "none",
-                "keys_separated_from_ledger": self.keys_separated_from_ledger,
-                "live_store_covered": True,
-                "pre_erasure_backups_covered": False,
-                "vendor_payload_encrypted": self.encrypt_vendor_payload,
-                "notes": (
-                    "Certifies live projection closure, backing adapter ID deletion, salted Merkle leaf/span redaction, "
-                    "and AES-256-GCM key shredding on this store. Backups created prior to erasure that copied "
-                    "unseparated keys remain outside technical coverage."
-                ),
-            }
-
-            unsigned = {
-                "certificate_id": cert_id,
-                "tenant_id": self.tenant_id,
-                "subject_id": subject_id,
-                "subject_tokens": list(subject_tokens),
-                "state_hash_before": before_hash,
-                "state_hash_after": after_hash,
-                "ledger_tail_hash": ev.event_hash,
-                "closure": effective_closure,
-                "probe_count": len(effective_probes),
-                "battery_all_abstained": True,
-                "cipher": CIPHER_NAME,
-                "key_destroyed": key_destroyed or record_keys_destroyed > 0,
-                "record_keys_destroyed": record_keys_destroyed,
-                "key_destroyed_at": destroyed_at,
-                "issued_at": issued_at,
-                "trust_boundary": trust_boundary,
-                "anchor": anchor_receipt.as_dict(),
-            }
-            signed_dict = sign_certificate_dict(unsigned, self.signer)
-            cert = ErasureCertificate(
-                certificate_id=signed_dict["certificate_id"],
-                tenant_id=signed_dict["tenant_id"],
-                subject_id=signed_dict["subject_id"],
-                subject_tokens=tuple(signed_dict["subject_tokens"]),
-                state_hash_before=signed_dict["state_hash_before"],
-                state_hash_after=signed_dict["state_hash_after"],
-                ledger_tail_hash=signed_dict["ledger_tail_hash"],
-                closure=signed_dict["closure"],
-                probe_count=signed_dict["probe_count"],
-                battery_all_abstained=signed_dict["battery_all_abstained"],
-                cipher=signed_dict["cipher"],
-                key_destroyed=signed_dict["key_destroyed"],
-                record_keys_destroyed=signed_dict["record_keys_destroyed"],
-                key_destroyed_at=signed_dict["key_destroyed_at"],
-                issued_at=signed_dict["issued_at"],
-                trust_boundary=signed_dict["trust_boundary"],
-                anchor=signed_dict["anchor"],
-                signer_scheme=signed_dict["signer_scheme"],
-                public_key=signed_dict["public_key"],
-                signature=signed_dict["signature"],
-            )
-            self.ledger.put_certificate(cert.as_dict())
             self._maybe_auto_checkpoint()
             return cert
 
@@ -1684,7 +2020,7 @@ class CustodyVault:
                 use_checkpoint=use_checkpoint,
             )
 
-    def export_bundle(self, *, include_ledger: bool = True) -> dict[str, Any]:
+    def export_bundle(self, *, include_ledger: bool = True, include_coverage: bool = True) -> dict[str, Any]:
         """Export self-contained redacted verification bundle checkable offline by `ember.verify`."""
         with self._lock:
             self._sync_state_from_ledger()
@@ -1707,6 +2043,8 @@ class CustodyVault:
                 "receipts": receipts,
                 "certificates": self.ledger.list_certificates(self.tenant_id),
             }
+            if include_coverage:
+                bundle["coverage"] = self._build_coverage_report().as_dict()
             if include_ledger:
                 bundle["ledger_events"] = [ev.as_dict() for ev in self.ledger.events(self.tenant_id)]
             return bundle
@@ -1824,5 +2162,32 @@ class AsyncCustodyVault:
     async def verify_item_receipt(self, item_id: str) -> bool:
         return await asyncio.to_thread(self._vault.verify_item_receipt, item_id)
 
-    async def export_bundle(self, *, include_ledger: bool = True) -> dict[str, Any]:
-        return await asyncio.to_thread(self._vault.export_bundle, include_ledger=include_ledger)
+    async def export_bundle(
+        self,
+        *,
+        include_ledger: bool = True,
+        include_coverage: bool = True,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._vault.export_bundle,
+            include_ledger=include_ledger,
+            include_coverage=include_coverage,
+        )
+
+    async def pending_erasures(self) -> list[PendingErasureRecord]:
+        return await asyncio.to_thread(self._vault.pending_erasures)
+
+    async def audit_coverage(
+        self,
+        subject_id: str | None = None,
+        *,
+        unverified_locations: Iterable[str] = (),
+    ) -> CoverageReport:
+        return await asyncio.to_thread(
+            self._vault.audit_coverage,
+            subject_id=subject_id,
+            unverified_locations=unverified_locations,
+        )
+
+    async def reconcile_erasures(self) -> ReconcileReport:
+        return await asyncio.to_thread(self._vault.reconcile_erasures)

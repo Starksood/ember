@@ -12,7 +12,7 @@ from typing import Any
 
 from . import __version__
 from .adapters import InMemoryStoreAdapter, MemoryStoreAdapter, SQLiteStoreAdapter
-from .audit import run_benchmark, run_v3_benchmark
+from .audit import run_benchmark, run_v3_benchmark, run_v4_benchmark
 from .config import EmberConfig, load_ember_config, open_vault_from_config
 from .crypto import DecryptionError, ERASED_TOMBSTONE
 from .kms import KmsOperationError
@@ -299,11 +299,35 @@ def _cmd_export(args: argparse.Namespace) -> int:
                     "documents": len(bundle["documents"]),
                     "receipts": len(bundle["receipts"]),
                     "certificates": len(bundle["certificates"]),
+                    "coverage_verdict": (bundle.get("coverage") or {}).get("verdict"),
                 },
                 indent=2,
             )
         )
         return 0
+    finally:
+        _close_vault_pair(vault, store)
+
+
+def _cmd_coverage(args: argparse.Namespace) -> int:
+    vault, store = _vault(args)
+    try:
+        rep = vault.audit_coverage(
+            subject_id=args.subject,
+            unverified_locations=args.unverified_location or (),
+        )
+        print(json.dumps(rep.as_dict(), indent=2))
+        return 0 if rep.erasure_certifiable else 1
+    finally:
+        _close_vault_pair(vault, store)
+
+
+def _cmd_reconcile(args: argparse.Namespace) -> int:
+    vault, store = _vault(args)
+    try:
+        rep = vault.reconcile_erasures()
+        print(json.dumps(rep.as_dict(), indent=2))
+        return 0 if rep.all_clean else 1
     finally:
         _close_vault_pair(vault, store)
 
@@ -326,8 +350,40 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def format_v4_benchmark_report(report: dict[str, Any]) -> str:
+    """Format the V4 paraphrase matrix, chaos recovery, and latency telemetry report."""
+    pm = report["paraphrase_matrix"]
+    chaos = report["chaos_recovery"]
+    lat = report["latency_ms"]
+    lines = [
+        f"\nEMBER ADVERSARIAL & CHAOS SUITE V4 — {report['subjects']} subjects",
+        "=" * 78,
+        f"  Paraphrase (trace_turn observed) leaks : {pm['observed_trace_turn_leaks']}/{report['subjects']}",
+        f"  Paraphrase (unobserved out-of-band)    : {pm['unobserved_out_of_band_leaks']}/{report['subjects']} (honestly outside custody)",
+        f"  audit_coverage() detection rate        : {pm['coverage_audit_detection_rate'] * 100:.1f}%",
+        f"  Bystanders & receipts intact           : {pm['all_bystanders_survived']}",
+        f"  Email + Unicode zombie content blocked : {pm['all_email_zombies_blocked'] and pm['all_unicode_zombies_blocked']}",
+        f"  Ed25519 certs valid                    : {pm['all_certificates_valid']}",
+        "-" * 78,
+        f"  Chaos transient outage reconcile       : {chaos['transient_outage_reconciled']}",
+        f"  Chaos cold restart auto_reconcile      : {chaos['restart_auto_reconcile_ok']}",
+        f"  Chaos cross-handle barrier race        : {chaos['cross_handle_barrier_race_blocked']}",
+        "-" * 78,
+        f"  Latency (n={lat['iterations']}, SQLite+FileKeyStore):",
+        f"    register_source : p50={lat['register_source']['p50_ms']:.3f} ms  p95={lat['register_source']['p95_ms']:.3f} ms",
+        f"    remember        : p50={lat['remember']['p50_ms']:.3f} ms  p95={lat['remember']['p95_ms']:.3f} ms",
+        f"    search          : p50={lat['search']['p50_ms']:.3f} ms  p95={lat['search']['p95_ms']:.3f} ms",
+        f"    erase           : p50={lat['erase']['p50_ms']:.3f} ms  p95={lat['erase']['p95_ms']:.3f} ms",
+        "=" * 78,
+        f"  PASSED: {report['passed']}",
+    ]
+    return "\n".join(lines)
+
+
 def format_benchmark_report(report: dict[str, Any]) -> str:
     """Format an adversarial erasure benchmark report with explicit adapter & search settings."""
+    if report.get("suite") == "ember_erasure_v4":
+        return format_v4_benchmark_report(report)
     adapter = report.get("adapter") or {}
     adapter_name = adapter.get("name", "unknown")
     retrieval_mode = adapter.get("retrieval_mode", "unknown")
@@ -382,7 +438,12 @@ def format_benchmark_report(report: dict[str, Any]) -> str:
 
 def _cmd_benchmark(args: argparse.Namespace) -> int:
     suite_name = getattr(args, "suite", "v2")
-    report = run_v3_benchmark() if suite_name == "v3" else run_benchmark()
+    if suite_name == "v4":
+        report = run_v4_benchmark()
+    elif suite_name == "v3":
+        report = run_v3_benchmark()
+    else:
+        report = run_benchmark()
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -536,8 +597,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_ver.add_argument("--html", default=None, help="Write standalone HTML compliance dossier to path")
     p_ver.set_defaults(func=_cmd_verify)
 
+    p_cov = sub.add_parser("coverage", help="Audit source linkage, lineage completeness, and unverified locations")
+    p_cov.add_argument("--subject", default=None, help="Optional subject_id preview")
+    p_cov.add_argument(
+        "--unverified-location",
+        action="append",
+        default=None,
+        help="Declare external/backup location outside live verification (repeatable)",
+    )
+    p_cov.set_defaults(func=_cmd_coverage)
+
+    p_rec = sub.add_parser("reconcile", help="Retry interrupted or failed erasures from durable journal")
+    p_rec.set_defaults(func=_cmd_reconcile)
+
     p_bench = sub.add_parser("benchmark", help="Run the 12-subject adversarial erasure suite")
-    p_bench.add_argument("--suite", choices=("v2", "v3"), default="v2")
+    p_bench.add_argument("--suite", choices=("v2", "v3", "v4"), default="v2")
     p_bench.add_argument("--json", action="store_true")
     p_bench.set_defaults(func=_cmd_benchmark)
 

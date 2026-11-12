@@ -11,12 +11,19 @@ Encodes the Phase 0 lessons learned from Fireweed:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+import hashlib
 import json
+import math
+from pathlib import Path
+import tempfile
+import threading
+import time
+import unicodedata
 from typing import Any
 
-from .adapters import InMemoryStoreAdapter, Mem0Adapter, MemoryStoreAdapter
+from .adapters import InMemoryStoreAdapter, Mem0Adapter, MemoryStoreAdapter, SQLiteStoreAdapter
 from .reducer import TombstonedSubjectError, decrypt_item_metadata, decrypt_item_payload
 from .vault import CustodyVault
 from .verify import verify_ed25519_certificate
@@ -261,6 +268,7 @@ SUITE_V2: tuple[SubjectScenario, ...] = (
 )
 
 SUITE_V3: tuple[SubjectScenario, ...] = SUITE_V2
+SUITE_V4: tuple[SubjectScenario, ...] = SUITE_V2
 
 
 def verify_suite_hygiene(suite: tuple[SubjectScenario, ...] = SUITE_V2) -> dict[str, Any]:
@@ -663,4 +671,369 @@ def run_v3_benchmark(
         "all_zombie_content_blocked": all_zombie_content,
         "passed": passed,
         "results": rows,
+    }
+
+
+def _percentile_ms(samples_ms: list[float], pct: float) -> float:
+    if not samples_ms:
+        return 0.0
+    ordered = sorted(samples_ms)
+    idx = min(len(ordered) - 1, max(0, math.ceil((pct / 100.0) * len(ordered)) - 1))
+    return round(ordered[idx], 3)
+
+
+class _FaultyDeleteAdapter:
+    """Adapter proxy injecting a transient `ConnectionError` on the first `delete()` call."""
+
+    def __init__(self, inner: MemoryStoreAdapter, *, fail_count: int = 1) -> None:
+        self._inner = inner
+        self._remaining_fails = fail_count
+        self.delete_calls = 0
+
+    def upsert(self, **kwargs: Any) -> tuple[str, ...]:
+        return self._inner.upsert(**kwargs)
+
+    def search(self, query: str, *, limit: int = 5, filters: dict[str, Any] | None = None):
+        return self._inner.search(query, limit=limit, filters=filters)
+
+    def delete(self, record_ids: Iterable[str]) -> int:
+        self.delete_calls += 1
+        if self._remaining_fails > 0:
+            self._remaining_fails -= 1
+            raise ConnectionError("injected transient store delete timeout")
+        return self._inner.delete(record_ids)
+
+
+def _run_v4_paraphrase_track(scenario: SubjectScenario) -> dict[str, Any]:
+    """Compare observed trace_turn() vs unobserved out-of-band entity-free paraphrase writes."""
+    tag = hashlib.sha256(scenario.subject.encode("utf-8")).hexdigest()[:8]
+    unique_paraphrase_token = f"indirectbadge_{tag}"
+    entity_free_paraphrase = (
+        f"Staff briefing note ({unique_paraphrase_token}): longtime specialist handling evening intake shifts."
+    )
+    email_alias = f"{scenario.subject.lower()}@example.org"
+    nfd_alias = unicodedata.normalize("NFD", f"{scenario.subject}\u00e9")
+
+    # Track 1A: Observed write inside trace_turn() -> entity-free paraphrase MUST cascade-delete cleanly.
+    obs_adapter = InMemoryStoreAdapter()
+    obs_leaks = 0
+    obs_cert_ok = False
+    obs_bystander_ok = False
+    obs_email_blocked = False
+    obs_unicode_blocked = False
+    with CustodyVault.ephemeral(adapter=obs_adapter, encrypt_vendor_payload=True) as v_obs:
+        v_obs.register_source(
+            "doc_v4_obs",
+            " ".join([*scenario.facts, *scenario.bystander_facts]),
+            span_mode="clause",
+            origin="v4_paraphrase",
+        )
+        v_obs.remember(
+            scenario.facts[0],
+            subjects=[scenario.subject],
+            aliases=[email_alias, nfd_alias],
+            source_id="doc_v4_obs",
+            quote=scenario.facts[0],
+        )
+        bys_res = v_obs.remember(
+            scenario.bystander_facts[0],
+            subjects=[scenario.peer],
+            source_id="doc_v4_obs",
+            quote=scenario.bystander_facts[0],
+        )
+        with v_obs.trace_turn():
+            _ = v_obs.search(scenario.facts[0], limit=5)
+            v_obs.remember(entity_free_paraphrase, subjects=["summary_bot"])
+
+        cert = v_obs.erase(
+            scenario.subject,
+            aliases=[email_alias, nfd_alias],
+            probes=[scenario.facts[0], unique_paraphrase_token],
+            markers=[*scenario.leak_markers, unique_paraphrase_token],
+        )
+        obs_cert_ok = verify_ed25519_certificate(cert.as_dict())[0] is True
+        res_para = v_obs.search(unique_paraphrase_token, limit=5)
+        if not res_para.abstained:
+            obs_leaks += 1
+        obs_bystander_ok = (
+            not v_obs.search(scenario.peer, limit=5).abstained
+            and v_obs.verify_item_receipt(bys_res.item.item_id)
+        )
+        try:
+            v_obs.remember(f"Ticket follow-up for {email_alias}", subjects=["crm_bot"])
+        except TombstonedSubjectError:
+            obs_email_blocked = True
+        try:
+            nfc_alias = unicodedata.normalize("NFC", nfd_alias)
+            v_obs.remember(f"Note mentioning {nfc_alias}", subjects=["crm_bot"])
+        except TombstonedSubjectError:
+            obs_unicode_blocked = True
+
+    # Track 1B: Unobserved out-of-band write OUTSIDE trace_turn() -> honestly leaks,
+    # AND `audit_coverage()` MUST detect the unattributed write 100% of the time.
+    unobs_adapter = InMemoryStoreAdapter()
+    unobs_leaked_honestly = False
+    coverage_caught_gap = False
+    with CustodyVault.ephemeral(adapter=unobs_adapter) as v_unobs:
+        v_unobs.register_source(
+            "doc_v4_unobs",
+            scenario.facts[0],
+            origin="v4_paraphrase",
+        )
+        v_unobs.remember(
+            scenario.facts[0],
+            subjects=[scenario.subject],
+            source_id="doc_v4_unobs",
+            quote=scenario.facts[0],
+        )
+        # Unobserved out-of-band summary (outside trace_turn, no derived_from, no source_id)
+        v_unobs.remember(entity_free_paraphrase, subjects=["rogue_summarizer"])
+        cov = v_unobs.audit_coverage()
+        coverage_caught_gap = (
+            cov.verdict == "bounded_with_warnings"
+            and cov.unattributed_item_count >= 1
+            and cov.lineage_capture_rate < 1.0
+        )
+        v_unobs.erase(scenario.subject, markers=scenario.leak_markers)
+        res_unobs = v_unobs.search(unique_paraphrase_token, limit=5)
+        unobs_leaked_honestly = any(unique_paraphrase_token in h.text for h in res_unobs.hits)
+
+    return {
+        "subject": scenario.subject,
+        "observed_traced_paraphrase_leaks": obs_leaks,
+        "observed_cert_valid": obs_cert_ok,
+        "observed_bystander_ok": obs_bystander_ok,
+        "email_zombie_blocked": obs_email_blocked,
+        "unicode_zombie_blocked": obs_unicode_blocked,
+        "unobserved_out_of_band_leaks": 1 if unobs_leaked_honestly else 0,
+        "coverage_caught_unattributed_gap": coverage_caught_gap,
+    }
+
+
+def _run_v4_chaos_track() -> dict[str, Any]:
+    """Execute crash & fault-injection chaos tests: mid-erase outage, cold restart reconcile, barrier race."""
+    # 1. Transient mid-erase vendor failure -> incomplete verdict -> manual reconcile_erasures()
+    inner = InMemoryStoreAdapter()
+    faulty = _FaultyDeleteAdapter(inner, fail_count=1)
+    transient_ok = False
+    with CustodyVault.ephemeral(adapter=faulty) as v:
+        v.register_source("c1", "Elena Vance takes Eliquis daily. Sam Patel likes tea.")
+        v.remember("Elena Vance takes Eliquis daily.", subjects=["elena"], source_id="c1")
+        v.remember("Sam Patel likes tea.", subjects=["sam"], source_id="c1")
+        failed_caught = False
+        try:
+            v.erase("elena", markers=["Elena", "Eliquis"])
+        except ConnectionError:
+            failed_caught = True
+        cov_during_outage = v.audit_coverage()
+        rep = v.reconcile_erasures()
+        cov_after = v.audit_coverage()
+        transient_ok = (
+            failed_caught
+            and cov_during_outage.verdict == "incomplete"
+            and cov_during_outage.pending_erasure_count == 1
+            and rep.all_clean
+            and rep.attempted == 1
+            and cov_after.verdict == "complete"
+            and v.search("Eliquis").abstained
+            and not v.search("tea").abstained
+        )
+
+    # 2. Disk-backed crash recovery on fresh CustodyVault.open(..., auto_reconcile=True)
+    disk_reconcile_ok = False
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        data_dir = root / "vault_data"
+        key_dir = root / "vault_keys"
+        store_path = root / "store.db"
+        store1 = SQLiteStoreAdapter(str(store_path))
+        faulty1 = _FaultyDeleteAdapter(store1, fail_count=1)
+        v1 = CustodyVault.open(data_dir, key_dir=key_dir, adapter=faulty1)
+        try:
+            v1.register_source("disk_src", "Marta Novak has peanut allergy. Leo Kim plays chess.")
+            v1.remember("Marta Novak has peanut allergy.", subjects=["marta"], source_id="disk_src")
+            v1.remember("Leo Kim plays chess.", subjects=["leo"], source_id="disk_src")
+            try:
+                v1.erase("marta", markers=["Marta", "peanut"])
+            except ConnectionError:
+                pass
+        finally:
+            v1.close()
+            store1.close()
+
+        # Reopen fresh handle simulating process restart after vendor recovered
+        store2 = SQLiteStoreAdapter(str(store_path))
+        try:
+            with CustodyVault.open(
+                data_dir,
+                key_dir=key_dir,
+                adapter=store2,
+                auto_reconcile=True,
+            ) as v2:
+                cov2 = v2.audit_coverage()
+                certs = v2.ledger.list_certificates(v2.tenant_id)
+                disk_reconcile_ok = (
+                    cov2.verdict == "complete"
+                    and len(v2.pending_erasures()) == 0
+                    and len(certs) == 1
+                    and verify_ed25519_certificate(certs[0])[0] is True
+                    and v2.search("peanut").abstained
+                    and not v2.search("chess").abstained
+                )
+        finally:
+            store2.close()
+
+    # 3. Cross-handle concurrency barrier chaos (read before erase, write after erase fails + retry stays blocked)
+    barrier_ok = False
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        data_dir = root / "race_data"
+        key_dir = root / "race_keys"
+        store_a = SQLiteStoreAdapter(str(root / "race_store.db"))
+        store_b = SQLiteStoreAdapter(str(root / "race_store.db"))
+        va = CustodyVault.open(data_dir, key_dir=key_dir, adapter=store_a)
+        vb = CustodyVault.open(data_dir, key_dir=key_dir, adapter=store_b)
+        try:
+            va.register_source("race_doc", "Nora Lin takes lithium. Omar Aziz bakes bread.")
+            src_item = va.remember("Nora Lin takes lithium.", subjects=["nora"], source_id="race_doc")
+            va.remember("Omar Aziz bakes bread.", subjects=["omar"], source_id="race_doc")
+
+            barrier = threading.Barrier(2, timeout=5.0)
+            writer_errors: list[str] = []
+
+            def _delayed_writer() -> None:
+                try:
+                    barrier.wait()
+                    time.sleep(0.02)
+                    vb.remember(
+                        "Delayed summary: Nora Lin takes lithium",
+                        subjects=["nora"],
+                        derived_from=[src_item.item.item_id],
+                    )
+                except Exception as exc:
+                    writer_errors.append(type(exc).__name__)
+
+            t = threading.Thread(target=_delayed_writer)
+            t.start()
+            barrier.wait()
+            va.erase("nora", markers=["Nora", "lithium"])
+            t.join(timeout=5.0)
+
+            # Retry delayed write once more synchronously to verify tombstone holds
+            retry_blocked = False
+            try:
+                vb.remember("Retry summary: Nora Lin takes lithium", subjects=["nora"])
+            except TombstonedSubjectError:
+                retry_blocked = True
+
+            barrier_ok = (
+                bool(writer_errors)
+                and retry_blocked
+                and va.search("lithium").abstained
+                and not va.search("bread").abstained
+            )
+        finally:
+            va.close()
+            vb.close()
+            store_a.close()
+            store_b.close()
+
+    return {
+        "transient_outage_reconciled": transient_ok,
+        "restart_auto_reconcile_ok": disk_reconcile_ok,
+        "cross_handle_barrier_race_blocked": barrier_ok,
+        "passed": transient_ok and disk_reconcile_ok and barrier_ok,
+    }
+
+
+def _run_v4_latency_benchmark(*, iterations: int = 25) -> dict[str, Any]:
+    """Measure real wall-clock p50/p95 overhead with SQLiteLedger + FileKeyStore + SQLiteStoreAdapter."""
+    reg_ms: list[float] = []
+    rem_ms: list[float] = []
+    search_ms: list[float] = []
+    erase_ms: list[float] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        store = SQLiteStoreAdapter(str(root / "bench_store.db"))
+        try:
+            with CustodyVault.open(root / "bench_data", key_dir=root / "bench_keys", adapter=store) as vault:
+                for idx in range(iterations):
+                    sid = f"doc_{idx}"
+                    subj = f"subj_{idx}"
+                    text = f"Subject {subj} recorded clinical note number {idx} with unique token tok_{idx}."
+                    t0 = time.perf_counter()
+                    vault.register_source(sid, text, origin="v4_latency")
+                    reg_ms.append((time.perf_counter() - t0) * 1000.0)
+
+                    t1 = time.perf_counter()
+                    vault.remember(text, subjects=[subj], source_id=sid, quote=text)
+                    rem_ms.append((time.perf_counter() - t1) * 1000.0)
+
+                    t2 = time.perf_counter()
+                    vault.search(f"tok_{idx}", limit=5)
+                    search_ms.append((time.perf_counter() - t2) * 1000.0)
+
+                    t3 = time.perf_counter()
+                    vault.erase(subj, probes=[f"tok_{idx}"], markers=[subj, f"tok_{idx}"])
+                    erase_ms.append((time.perf_counter() - t3) * 1000.0)
+        finally:
+            store.close()
+
+    return {
+        "iterations": iterations,
+        "register_source": {"p50_ms": _percentile_ms(reg_ms, 50), "p95_ms": _percentile_ms(reg_ms, 95)},
+        "remember": {"p50_ms": _percentile_ms(rem_ms, 50), "p95_ms": _percentile_ms(rem_ms, 95)},
+        "search": {"p50_ms": _percentile_ms(search_ms, 50), "p95_ms": _percentile_ms(search_ms, 95)},
+        "erase": {"p50_ms": _percentile_ms(erase_ms, 50), "p95_ms": _percentile_ms(erase_ms, 95)},
+    }
+
+
+def run_v4_benchmark(
+    suite: tuple[SubjectScenario, ...] = SUITE_V4,
+    *,
+    latency_iterations: int = 25,
+) -> dict[str, Any]:
+    """Execute Ember V4 adversarial suite: paraphrase matrix, crash/chaos recovery, and real latency telemetry."""
+    hygiene = verify_suite_hygiene(suite)
+    paraphrase_rows = [_run_v4_paraphrase_track(s) for s in suite]
+    chaos = _run_v4_chaos_track()
+    latency = _run_v4_latency_benchmark(iterations=latency_iterations)
+
+    obs_leaks = sum(r["observed_traced_paraphrase_leaks"] for r in paraphrase_rows)
+    unobs_leaks = sum(r["unobserved_out_of_band_leaks"] for r in paraphrase_rows)
+    cov_detection_rate = sum(1 for r in paraphrase_rows if r["coverage_caught_unattributed_gap"]) / max(
+        1, len(paraphrase_rows)
+    )
+    all_bystanders = all(r["observed_bystander_ok"] for r in paraphrase_rows)
+    all_certs = all(r["observed_cert_valid"] for r in paraphrase_rows)
+    all_email_blocked = all(r["email_zombie_blocked"] for r in paraphrase_rows)
+    all_unicode_blocked = all(r["unicode_zombie_blocked"] for r in paraphrase_rows)
+
+    passed = (
+        obs_leaks == 0
+        and unobs_leaks > 0
+        and cov_detection_rate == 1.0
+        and all_bystanders
+        and all_certs
+        and all_email_blocked
+        and all_unicode_blocked
+        and chaos["passed"]
+    )
+    return {
+        "suite": "ember_erasure_v4",
+        "hygiene": hygiene,
+        "subjects": len(paraphrase_rows),
+        "paraphrase_matrix": {
+            "observed_trace_turn_leaks": obs_leaks,
+            "unobserved_out_of_band_leaks": unobs_leaks,
+            "coverage_audit_detection_rate": round(cov_detection_rate, 4),
+            "all_bystanders_survived": all_bystanders,
+            "all_certificates_valid": all_certs,
+            "all_email_zombies_blocked": all_email_blocked,
+            "all_unicode_zombies_blocked": all_unicode_blocked,
+            "rows": paraphrase_rows,
+        },
+        "chaos_recovery": chaos,
+        "latency_ms": latency,
+        "passed": passed,
     }

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ember-custody"
-version = "0.2.1"
+version = "0.3.0"
 description = "Cryptographic custody, redactable Merkle receipts, and verifiable cascade erasure for AI memory and RAG stores."
 readme = "README.md"
 requires-python = ">=3.11"

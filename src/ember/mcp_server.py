@@ -13,7 +13,7 @@ from .cli import _close_vault_pair, _vault
 from .crypto import DecryptionError
 from .kms import KmsOperationError
 from .ledger import IdempotencyConflict, LedgerIntegrityError
-from .reducer import ErasureIncomplete, InvariantViolation, TombstonedSubjectError
+from .reducer import ConcurrentModificationError, ErasureIncomplete, InvariantViolation, TombstonedSubjectError
 from .vault import CustodyVault
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -102,6 +102,25 @@ _TOOLS: tuple[dict[str, Any], ...] = (
             "properties": {
                 "include_ledger": {"type": "boolean", "default": True},
             },
+        },
+    },
+    {
+        "name": "ember_audit_coverage",
+        "description": "Audit source linkage, lineage completeness, pending erasures, and unverified locations.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "subject_id": {"type": ["string", "null"], "default": None},
+                "unverified_locations": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "name": "ember_reconcile_erasures",
+        "description": "Retry any interrupted or failed pending erasures until backend deletion and certification succeed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
         },
     },
 )
@@ -221,11 +240,22 @@ class EmberMcpServer:
             if name == "ember_export_bundle":
                 return self.vault.export_bundle(include_ledger=bool(args.get("include_ledger", True))), False
 
+            if name == "ember_audit_coverage":
+                cov = self.vault.audit_coverage(
+                    subject_id=args.get("subject_id"),
+                    unverified_locations=args.get("unverified_locations") or (),
+                )
+                return cov.as_dict(), False
+
+            if name == "ember_reconcile_erasures":
+                return self.vault.reconcile_erasures().as_dict(), False
+
             raise _UnknownToolError(name)
         except (
             TombstonedSubjectError,
             ErasureIncomplete,
             IdempotencyConflict,
+            ConcurrentModificationError,
             InvariantViolation,
             LedgerIntegrityError,
             DecryptionError,

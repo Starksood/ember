@@ -1,6 +1,6 @@
 # Ember (`ember-custody`)
 
-> **Proof that survives erasure.** Cryptographic custody, redactable Merkle provenance receipts, and adversarially tested cascade deletion for AI memory and RAG stores.
+> **Proof that survives erasure.** Cryptographic custody, redactable Merkle receipts, explicit lineage-coverage audits, and crash-reconciled cascade deletion for AI memory and RAG stores.
 
 Existing memory engines (`Mem0`, `Qdrant`, `Chroma`, `pgvector`, `Pinecone`, `LangChain`, `LlamaIndex`) know how to store embeddings and delete by top-level `user_id`. Under GDPR Article 17 ("Right to be Forgotten") and enterprise audit requirements, three failures still happen silently:
 
@@ -25,6 +25,9 @@ Existing memory engines (`Mem0`, `Qdrant`, `Chroma`, `pgvector`, `Pinecone`, `La
 - **Keyed Content Tombstones, Fail-Closed Certificates & External Anchoring (`ember.reducer`, `ember.signing`):**
   - Vault-keyed HMAC-SHA256 subject and content tombstones block silent/un-tagged zombie re-ingestion (`TombstonedSubjectError`) unless an explicit `reconsent_id` is supplied.
   - `erase()` synthesizes `auto_probes` alongside caller `probes`, queries the **raw wrapped store**, raises `ErasureIncomplete` if any residue remains, signs an `Ed25519` certificate, and optionally anchors digests to RFC 3161 TSAs (`Rfc3161Anchor`) or Sigstore Rekor (`RekorAnchor`).
+- **First-Class Coverage Audits & Durable Crash Reconciliation (`ember.coverage`, `ember.vault`):**
+  - `vault.audit_coverage()` reports honest verdicts (`"complete" | "bounded_with_warnings" | "incomplete"`), orphan sources, unattributed out-of-band writes (`lineage_capture_rate`), unverified storage locations (e.g., colocated keystores, unencrypted Mem0 history DBs, declared snapshots), and embeds a summary into every signed `ErasureCertificate.trust_boundary["coverage"]` and HTML compliance dossier.
+  - Interrupted `erase()` operations persist in a durable `pending_erasures` journal and auto-recover via `vault.reconcile_erasures()` or `CustodyVault.open(..., auto_reconcile=True)` (with probes/aliases scrubbed once complete).
 - **Offline Verifier & Air-Gapped Compliance Dossier (`ember/verify.py`, `ember/report.py`):**
   - Copy [`src/ember/verify.py`](src/ember/verify.py) anywhere to verify Merkle redactions, bystander receipts, and ledger hash chains using Python's standard library alone (`python3 -S`).
   - Render self-contained zero-CDN HTML compliance dossiers with `ember verify bundle.json --html report.html`.
@@ -138,6 +141,8 @@ Async agents can use `await AsyncCustodyVault.open(...)` or `async with vault.tr
 python examples/wrap_mem0.py
 python examples/redactable_transcript.py
 python examples/offline_verify_bundle.py
+python examples/integrations/support_bot_app.py --benchmark
+python examples/integrations/langgraph_research_agent.py --benchmark
 ```
 
 ### 2. CLI, `ember.toml` & Air-Gapped HTML Dossier
@@ -149,7 +154,9 @@ ember --vault .ember --key-dir .keys add-source doc1 \
   --span-mode clause
 ember --vault .ember --key-dir .keys remember "Priya lives in Portland." --subject priya --source-id doc1 --meta email=priya@example.org
 ember --vault .ember --key-dir .keys remember "Marcus lives in Leeds." --subject marcus --source-id doc1
+ember --vault .ember --key-dir .keys coverage --subject priya
 ember --vault .ember --key-dir .keys erase priya --probe "Where does Priya live?"
+ember --vault .ember --key-dir .keys reconcile
 ember --vault .ember --key-dir .keys checkpoint
 ember --vault .ember --key-dir .keys replay --use-checkpoint
 ember --vault .ember --key-dir .keys export --out bundle.json
@@ -201,13 +208,39 @@ const cert = await ember.erase({ subject_id: "maya", probes: ["warfarin"] });
 
 ## Adversarial Benchmark & Two-Direction Calibration
 
-Run both the V2 suite and the expanded V3 Phase-2 suite across 12 subjects × 7 attack classes (`direct`, `paraphrase`, `inference`, `multi_hop`, `attribute`, `temporal`, `aggregate` — 204 attack probes total):
+Run the V2/V3 204-probe suites or the V4 paraphrase, crash-recovery chaos, and p50/p95 latency suite:
 
 ```bash
 ember benchmark --suite v3
+ember benchmark --suite v4
 ```
 
-Measured output against `InMemoryStoreAdapter`:
+Measured V4 output (`ember benchmark --suite v4`):
+
+```text
+EMBER ADVERSARIAL & CHAOS SUITE V4 — 12 subjects
+==============================================================================
+  Paraphrase (trace_turn observed) leaks : 0/12
+  Paraphrase (unobserved out-of-band)    : 12/12 (honestly outside custody)
+  audit_coverage() detection rate        : 100.0%
+  Bystanders & receipts intact           : True
+  Email + Unicode zombie content blocked : True
+  Ed25519 certs valid                    : True
+------------------------------------------------------------------------------
+  Chaos transient outage reconcile       : True
+  Chaos cold restart auto_reconcile      : True
+  Chaos cross-handle barrier race        : True
+------------------------------------------------------------------------------
+  Latency (n=25, SQLite+FileKeyStore):
+    register_source : p50=0.171 ms  p95=0.217 ms
+    remember        : p50=0.529 ms  p95=0.697 ms
+    search          : p50=0.035 ms  p95=0.052 ms
+    erase           : p50=1.730 ms  p95=2.664 ms
+==============================================================================
+  PASSED: True
+```
+
+Measured V3 output against `InMemoryStoreAdapter`:
 
 ```text
 EMBER ERASURE ADVERSARIAL SUITE V3 — 12 subjects, 204 probes (7 attack classes)
@@ -258,13 +291,14 @@ Why bystander checks are co-primary: leak rate alone is monotone in deletion —
 
 ---
 
-## Honest Threat Model Limits
+## Bounded Guarantees & Honest Threat Model Limits
 
-Ember documents what cryptography cannot invent locally (see [`SECURITY.md`](SECURITY.md) and [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)):
+Ember delivers **verifiable custody and bounded erasure assurance** — never claiming that cryptography can invent knowledge of external copies outside its custody boundary (see [`SECURITY.md`](SECURITY.md) and [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)):
 
 1. **Key Separation & Backups:** Crypto-shredding protects live logs and snapshots taken *after* erasure only if pre-erasure backups did not copy unshredded keys alongside ledger storage. Configure a separate `key_dir` or use `AwsKmsKeyStore`, `GcpKmsKeyStore`, or `VaultTransitKeyStore` + `PostgresLedger`.
 2. **External Time Anchoring:** Self-signed local `Ed25519` proofs establish internal ordering and integrity; preventing an operator holding both ledger and signing key from backdating history requires `Rfc3161Anchor` or `RekorAnchor`.
-3. **Wrapped Store Internal History Tables (e.g., Mem0 `history.db`):** `Mem0Adapter` deletes live Mem0 vector points (and Mem0 strips entity links), while Ember's own ledger stays AES-256-GCM encrypted and crypto-shredded. However, OSS `mem0.Memory` also maintains an internal plaintext SQLite history DB (`history_db_path`, logging `old_memory` even on `"DELETE"` events). Configure `encrypt_vendor_payload=True` + an `embedder` (bypassing `.add()`) or isolate/prune `history_db_path`.
+3. **Lineage & Unobserved Writes:** Ember guarantees dependency closure over records attributed to subjects, `source_id`, `derived_from`, or `trace_turn()`. Unattributed writes or external backups outside Ember's boundary cannot be auto-cascaded silently — `audit_coverage()` surfaces them explicitly (`"bounded_with_warnings"` / `"incomplete"`) and embeds the coverage snapshot inside every signed certificate.
+4. **Wrapped Store Internal History Tables (e.g., Mem0 `history.db`):** `Mem0Adapter` deletes live Mem0 vector points (and Mem0 strips entity links), while Ember's own ledger stays AES-256-GCM encrypted and crypto-shredded. However, OSS `mem0.Memory` also maintains an internal plaintext SQLite history DB (`history_db_path`, logging `old_memory` even on `"DELETE"` events). Configure `encrypt_vendor_payload=True` + an `embedder` (bypassing `.add()`) or isolate/prune `history_db_path`.
 
 ---
 

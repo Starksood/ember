@@ -29,6 +29,7 @@ from pathlib import Path
 import secrets
 import sqlite3
 import threading
+import unicodedata
 
 from .crypto import new_key
 
@@ -100,7 +101,7 @@ class KeyStore(ABC):
 
 
 def _normalize_identifier(value: str) -> str:
-    return " ".join(value.strip().lower().split())
+    return " ".join(unicodedata.normalize("NFKC", value).strip().lower().split())
 
 
 _FILE_KEYSTORE_LOCK = threading.RLock()

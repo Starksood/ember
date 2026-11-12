@@ -19,7 +19,7 @@ test("EmberClient sends Bearer token, X-Ember-Tenant, and surfaces typed EmberAp
       return new Response(
         JSON.stringify({
           status: "ok",
-          version: "0.2.0",
+          version: "0.3.0",
           tenant_id: "acme",
           keys_separated_from_ledger: true,
           encrypt_vendor_payload: false,
@@ -34,6 +34,48 @@ test("EmberClient sends Bearer token, X-Ember-Tenant, and surfaces typed EmberAp
           detail: "subject erased",
         }),
         { status: 403 },
+      );
+    }
+    if (url.includes("/v1/coverage")) {
+      return new Response(
+        JSON.stringify({
+          tenant_id: "acme",
+          subject_id: "alice",
+          verdict: "bounded_with_warnings",
+          erasure_certifiable: true,
+          summary: "Bounded with warnings",
+          ledger_chain_ok: true,
+          source_count: 1,
+          sources_linked_count: 1,
+          orphan_source_ids: [],
+          source_coverage_rate: 1.0,
+          live_item_count: 2,
+          attributed_item_count: 1,
+          unattributed_item_count: 1,
+          unattributed_item_ids: ["item_unattr"],
+          traced_item_count: 0,
+          derived_item_count: 0,
+          derived_dependency_count: 0,
+          lineage_capture_rate: 0.5,
+          verified_stores: [],
+          unverified_locations: [],
+          pending_erasure_count: 0,
+          pending_erasures: [],
+          recommendations: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url.endsWith("/v1/reconcile")) {
+      return new Response(
+        JSON.stringify({
+          attempted: 1,
+          all_clean: true,
+          completed_ids: ["era_1"],
+          still_failing: [],
+          certificate_ids: ["cert_1"],
+        }),
+        { status: 200 },
       );
     }
     return new Response(JSON.stringify({ query: "q", abstained: true, filtered_orphans: 0, hits: [] }), { status: 200 });
@@ -64,6 +106,14 @@ test("EmberClient sends Bearer token, X-Ember-Tenant, and surfaces typed EmberAp
       return true;
     },
   );
+
+  const cov = await client.coverage({ subjectId: "alice", unverifiedLocations: ["s3_snapshot"] });
+  assert.equal(cov.verdict, "bounded_with_warnings");
+  assert.equal(cov.unattributed_item_count, 1);
+
+  const rec = await client.reconcile();
+  assert.equal(rec.all_clean, true);
+  assert.deepEqual(rec.certificate_ids, ["cert_1"]);
 });
 
 const liveUrl = process.env.EMBER_LIVE_TEST_URL;
@@ -105,6 +155,13 @@ if (liveUrl) {
 
     const mayaAfter = await client.search({ query: "warfarin" });
     assert.equal(mayaAfter.abstained, true);
+
+    const cov = await client.coverage({ subjectId: "leo" });
+    assert.equal(cov.verdict, "complete");
+    assert.equal(cov.ledger_chain_ok, true);
+
+    const rec = await client.reconcile();
+    assert.equal(rec.all_clean, true);
 
     const leoAfter = await client.search({ query: "violin" });
     assert.equal(leoAfter.abstained, false);

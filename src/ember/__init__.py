@@ -1,6 +1,6 @@
 """Ember: cryptographic custody, redactable Merkle receipts, and verifiable cascade erasure."""
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 from .adapters import (
     AdapterHit,
@@ -18,6 +18,7 @@ from .adapters import (
 from .audit import (
     SUITE_V2,
     SUITE_V3,
+    SUITE_V4,
     BenchmarkBackendSpec,
     ScenarioBackendPair,
     SubjectScenario,
@@ -26,6 +27,7 @@ from .audit import (
     run_benchmark,
     run_v3_benchmark,
     run_v3_subject_scenario,
+    run_v4_benchmark,
     verify_suite_hygiene,
 )
 from .config import (
@@ -35,6 +37,7 @@ from .config import (
     open_vault_from_config,
     parse_ember_config_dict,
 )
+from .coverage import CoverageReport, analyze_coverage
 from .crypto import CIPHER_NAME, ERASED_TOMBSTONE, DecryptionError
 from .frameworks import (
     EmberDocument,
@@ -66,7 +69,15 @@ from .merkle import (
     split_spans_with_offsets,
 )
 from .receipts import Receipt, locate_span, mint_flat_receipt, mint_redactable_receipt
-from .records import ClosureManifest, ErasureCertificate, LedgerEvent, MemoryItem, SourceRecord
+from .records import (
+    ClosureManifest,
+    ErasureCertificate,
+    LedgerEvent,
+    MemoryItem,
+    PendingErasureRecord,
+    ReconcileReport,
+    SourceRecord,
+)
 from .reducer import (
     ConcurrentModificationError,
     EmberState,
@@ -105,6 +116,7 @@ __all__ = [
     "ChromaAdapter",
     "ClosureManifest",
     "ConcurrentModificationError",
+    "CoverageReport",
     "CustodyVault",
     "DecryptionError",
     "ERASED_TOMBSTONE",
@@ -138,12 +150,14 @@ __all__ = [
     "MemoryKeyStore",
     "MemoryStoreAdapter",
     "NullAnchor",
+    "PendingErasureRecord",
     "PgVectorAdapter",
     "PineconeAdapter",
     "PostgresLedger",
     "QdrantAdapter",
     "QueryHit",
     "Receipt",
+    "ReconcileReport",
     "RedactableDoc",
     "ReductionError",
     "RekorAnchor",
@@ -154,6 +168,7 @@ __all__ = [
     "SQLiteStoreAdapter",
     "SUITE_V2",
     "SUITE_V3",
+    "SUITE_V4",
     "ScenarioBackendPair",
     "SearchResult",
     "ShredReport",
@@ -167,6 +182,7 @@ __all__ = [
     "VaultTransitKeyStore",
     "VectorStoreAdapter",
     "__version__",
+    "analyze_coverage",
     "apply_event",
     "compute_closure",
     "create_asgi_app",
@@ -189,6 +205,7 @@ __all__ = [
     "run_benchmark",
     "run_v3_benchmark",
     "run_v3_subject_scenario",
+    "run_v4_benchmark",
     "split_parts",
     "split_spans_with_offsets",
     "start_background_server",

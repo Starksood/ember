@@ -144,6 +144,41 @@ export interface HealthResponse {
   encrypt_vendor_payload: boolean;
 }
 
+export interface CoverageReport {
+  tenant_id: string;
+  subject_id: string | null;
+  verdict: "complete" | "bounded_with_warnings" | "incomplete";
+  erasure_certifiable: boolean;
+  summary: string;
+  ledger_chain_ok: boolean;
+  source_count: number;
+  sources_linked_count: number;
+  orphan_source_ids: string[];
+  source_coverage_rate: number;
+  live_item_count: number;
+  attributed_item_count: number;
+  unattributed_item_count: number;
+  unattributed_item_ids: string[];
+  traced_item_count: number;
+  derived_item_count: number;
+  derived_dependency_count: number;
+  lineage_capture_rate: number;
+  verified_stores: Record<string, unknown>[];
+  unverified_locations: string[];
+  pending_erasure_count: number;
+  pending_erasures: Record<string, unknown>[];
+  recommendations: string[];
+  subject_preview?: Record<string, unknown>;
+}
+
+export interface ReconcileReport {
+  attempted: number;
+  all_clean: boolean;
+  completed_ids: string[];
+  still_failing: { erasure_id: string; subject_id: string; error: string }[];
+  certificate_ids: string[];
+}
+
 export class EmberApiError extends Error {
   readonly status: number;
   readonly code: string;
@@ -235,5 +270,21 @@ export class EmberClient {
   exportBundle(includeLedger = true): Promise<Record<string, unknown>> {
     const q = includeLedger ? "true" : "false";
     return this.request<Record<string, unknown>>("GET", `/v1/bundle?include_ledger=${q}`);
+  }
+
+  coverage(options: { subjectId?: string; unverifiedLocations?: string[] } = {}): Promise<CoverageReport> {
+    const params = new URLSearchParams();
+    if (options.subjectId) {
+      params.set("subject_id", options.subjectId);
+    }
+    for (const loc of options.unverifiedLocations ?? []) {
+      params.append("unverified_location", loc);
+    }
+    const qs = params.toString();
+    return this.request<CoverageReport>("GET", qs ? `/v1/coverage?${qs}` : "/v1/coverage");
+  }
+
+  reconcile(): Promise<ReconcileReport> {
+    return this.request<ReconcileReport>("POST", "/v1/reconcile", {});
   }
 }

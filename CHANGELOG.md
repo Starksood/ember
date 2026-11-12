@@ -2,6 +2,24 @@
 
 All notable changes to `ember-custody` are documented here.
 
+## [0.3.0] — Coverage Auditing, Durable Crash Reconciliation, `SUITE_V4` & End-to-End Templates
+
+### Added
+- **First-Class Erasure Coverage & Lineage Completeness Audit (`ember.coverage`, `ember.vault`):**
+  - Added `CoverageReport`, `analyze_coverage()`, and `CustodyVault.audit_coverage()` / `AsyncCustodyVault.audit_coverage()` reporting explicit verdicts (`"complete" | "bounded_with_warnings" | "incomplete"`), `source_coverage_rate`, `lineage_capture_rate`, orphan sources, unattributed out-of-band writes, unresolved pending erasures, and structural/declared `unverified_locations` (`"colocated_keystore_and_ledger"`, `"mem0_internal_history_db"`, `"pending_erasure_reconciliation"`, and caller-declared caches/snapshots).
+  - Embedded privacy-safe coverage telemetry inside signed `ErasureCertificate.trust_boundary["coverage"]`, `export_bundle(include_coverage=True)`, air-gapped HTML compliance dossiers (`Section 5` in `ember.report.generate_html_report`), CLI (`ember coverage`), HTTP (`GET /v1/coverage`), MCP (`ember_audit_coverage`), and TypeScript SDK (`EmberClient.coverage()`).
+- **Durable Pending-Erasure Journal & Automated Crash Recovery (`ember.records`, `ember.ledger`, `ember.vault`):**
+  - Added `pending_erasures` storage on `SQLiteLedger` and `PostgresLedger`, `PendingErasureRecord`, `ReconcileReport`, `vault.pending_erasures()`, `vault.reconcile_erasures()`, and `CustodyVault.open(..., auto_reconcile=True)` (also exposed via `EmberMem0`, `ember reconcile`, `POST /v1/reconcile`, `ember_reconcile_erasures`, and `EmberClient.reconcile()`).
+  - Completed journal rows automatically scrub `aliases`, `probes`, `markers`, and `block_identifiers` so deleted subject probes never linger after recovery.
+- **`SUITE_V4` Paraphrase, Crash Chaos & Latency Telemetry (`ember.audit`, `ember.cli`):**
+  - Added `SUITE_V4`, `run_v4_benchmark()`, and `ember benchmark --suite v4` benchmarking entity-free paraphrases inside vs. outside `trace_turn()`, `audit_coverage()` detection rates, Unicode `NFKC`/email alias zombie blocking, mid-erase fault recovery, on-disk restart `auto_reconcile`, cross-handle `threading.Barrier` races, and `SQLiteLedger` + `FileKeyStore` `p50_ms`/`p95_ms` latency.
+- **End-to-End External Integration Templates (`examples/integrations/`):**
+  - Added runnable [`support_bot_app.py`](examples/integrations/support_bot_app.py), [`langgraph_research_agent.py`](examples/integrations/langgraph_research_agent.py), and [`examples/integrations/README.md`](examples/integrations/README.md) with measured integration overhead numbers.
+
+### Fixed
+- **Unicode `NFKC` Identifier Normalization (`ember.keystore`, `ember.vault`):**
+  - Applied `unicodedata.normalize("NFKC", ...)` in `_normalize_identifier()` and `_extract_content_candidates()` so canonically equivalent NFD/NFC aliases hash to identical `tombstone_token`, `content_tombstone_token`, `subject_ref`, and `blind_token` values.
+
 ## [0.2.1] — Concurrency Hardening & Delayed-Write Race Coverage
 
 ### Added

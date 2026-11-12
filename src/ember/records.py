@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -237,3 +238,102 @@ class ErasureCertificate:
 
     def digest(self) -> str:
         return sha256_prefixed(canonical_bytes(self.as_dict()))
+
+
+@dataclass(frozen=True)
+class PendingErasureRecord:
+    """Durable journal record tracking an in-flight or interrupted erasure across crashes."""
+
+    erasure_id: str
+    tenant_id: str
+    subject_id: str
+    status: str  # "pending" | "failed" | "completed"
+    closure: dict[str, Any]
+    aliases: tuple[str, ...] = ()
+    probes: tuple[str, ...] = ()
+    markers: tuple[str, ...] = ()
+    block_identifiers: tuple[str, ...] = ()
+    attempts: int = 1
+    last_error: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+    completed_at: str | None = None
+    certificate_id: str | None = None
+    subject_tokens: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "erasure_id": self.erasure_id,
+            "tenant_id": self.tenant_id,
+            "subject_id": self.subject_id,
+            "status": self.status,
+            "closure": self.closure,
+            "aliases": list(self.aliases),
+            "probes": list(self.probes),
+            "markers": list(self.markers),
+            "block_identifiers": list(self.block_identifiers),
+            "attempts": self.attempts,
+            "last_error": self.last_error,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "completed_at": self.completed_at,
+            "certificate_id": self.certificate_id,
+            "subject_tokens": list(self.subject_tokens),
+        }
+
+    def safe_summary(self) -> dict[str, Any]:
+        """Privacy-safe operational summary without subject PII or probe strings."""
+        return {
+            "erasure_id": self.erasure_id,
+            "status": self.status,
+            "attempts": self.attempts,
+            "last_error": self.last_error,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "completed_at": self.completed_at,
+            "certificate_id": self.certificate_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PendingErasureRecord":
+        return cls(
+            erasure_id=str(data["erasure_id"]),
+            tenant_id=str(data.get("tenant_id", "default")),
+            subject_id=str(data["subject_id"]),
+            status=str(data.get("status", "pending")),
+            closure=dict(data.get("closure") or {}),
+            aliases=tuple(str(x) for x in (data.get("aliases") or ())),
+            probes=tuple(str(x) for x in (data.get("probes") or ())),
+            markers=tuple(str(x) for x in (data.get("markers") or ())),
+            block_identifiers=tuple(str(x) for x in (data.get("block_identifiers") or ())),
+            attempts=int(data.get("attempts", 1)),
+            last_error=str(data["last_error"]) if data.get("last_error") is not None else None,
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+            completed_at=str(data["completed_at"]) if data.get("completed_at") is not None else None,
+            certificate_id=str(data["certificate_id"]) if data.get("certificate_id") is not None else None,
+            subject_tokens=tuple(str(x) for x in (data.get("subject_tokens") or ())),
+        )
+
+
+@dataclass(frozen=True)
+class ReconcileReport:
+    """Result summary produced by `CustodyVault.reconcile_erasures()`."""
+
+    attempted: int
+    completed_ids: tuple[str, ...]
+    still_failing: tuple[dict[str, str], ...]
+    certificates: tuple[ErasureCertificate, ...]
+
+    @property
+    def all_clean(self) -> bool:
+        return len(self.still_failing) == 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "attempted": self.attempted,
+            "all_clean": self.all_clean,
+            "completed_ids": list(self.completed_ids),
+            "still_failing": [dict(x) for x in self.still_failing],
+            "certificate_ids": [c.certificate_id for c in self.certificates],
+        }

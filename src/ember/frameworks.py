@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import Mem0Adapter
-from .records import ErasureCertificate
+from .coverage import CoverageReport
+from .records import ErasureCertificate, PendingErasureRecord, ReconcileReport
 from .signing import Ed25519Signer, TimestampAnchor
 from .vault import CustodyVault, QueryHit
 
@@ -310,6 +311,20 @@ class EmberMem0:
         if not user_id or not str(user_id).strip():
             raise ValueError("EmberMem0.delete_all() requires user_id for targeted cryptographic erasure")
         return self.erase(str(user_id), **kwargs)
+
+    def audit_coverage(
+        self,
+        subject_id: str | None = None,
+        *,
+        unverified_locations: Iterable[str] = (),
+    ) -> CoverageReport:
+        return self.vault.audit_coverage(subject_id=subject_id, unverified_locations=unverified_locations)
+
+    def pending_erasures(self) -> list[PendingErasureRecord]:
+        return self.vault.pending_erasures()
+
+    def reconcile_erasures(self) -> ReconcileReport:
+        return self.vault.reconcile_erasures()
 
 
 # ── Optional LangChain Base / Document Resolution ────────────────────────────

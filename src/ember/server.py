@@ -254,6 +254,19 @@ class EmberHttpApp:
                 bundle = self.vault.export_bundle(include_ledger=include_ledger)
                 return 200, {"Content-Type": "application/json"}, _json_bytes(bundle)
 
+            if method == "GET" and path == "/v1/coverage":
+                subject_id = (query.get("subject_id") or [None])[0]
+                unverified_locs = query.get("unverified_location") or ()
+                cov = self.vault.audit_coverage(
+                    subject_id=subject_id,
+                    unverified_locations=unverified_locs,
+                )
+                return 200, {"Content-Type": "application/json"}, _json_bytes(cov.as_dict())
+
+            if method == "POST" and path == "/v1/reconcile":
+                rep = self.vault.reconcile_erasures()
+                return 200, {"Content-Type": "application/json"}, _json_bytes(rep.as_dict())
+
             return (
                 404,
                 {"Content-Type": "application/json"},
@@ -426,6 +439,8 @@ def create_asgi_app(
         Route("/v1/erase", _bridge, methods=["POST"]),
         Route("/v1/checkpoint", _bridge, methods=["POST"]),
         Route("/v1/bundle", _bridge, methods=["GET"]),
+        Route("/v1/coverage", _bridge, methods=["GET"]),
+        Route("/v1/reconcile", _bridge, methods=["POST"]),
     ]
     return Starlette(routes=routes)
 
