@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 from typing import Any
 import uuid
 
 import pytest
 
 from ember.adapters import Mem0Adapter, SQLiteStoreAdapter, VectorStoreAdapter
-from ember.reducer import ErasureIncomplete
+from ember.reducer import (
+    ConcurrentModificationError,
+    ErasureIncomplete,
+    InvariantViolation,
+    TombstonedSubjectError,
+)
 from ember.vault import CustodyVault
+from ember.verify import verify_bundle
 
 
 class FakeMem0V3Client:
@@ -376,3 +383,368 @@ def test_mem0_adapter_default_agent_id_queries_in_single_scope_when_uniform():
     assert len(strict.search_calls) == 1
     assert strict.search_calls[0]["filters"] == {"agent_id": "shared_agent"}
     v.close()
+
+
+def _make_race_backend(kind: str, tmp_path):
+    if kind == "mem0":
+        strict = StrictMem0V2Mock()
+        return Mem0Adapter(strict, search_threshold=0.1), lambda: [
+            row["memory"] for row in strict.rows.values()
+        ]
+    if kind == "vector":
+        vec = FakeVectorStore()
+        return VectorStoreAdapter(vec), lambda: [doc.page_content for doc in vec.docs.values()]
+    sql = SQLiteStoreAdapter(str(tmp_path / "ext_race.db"))
+    return sql, lambda: [
+        r[0]
+        for r in sql._conn.execute("SELECT text FROM external_memories").fetchall()
+    ]
+
+
+@pytest.mark.parametrize("backend_kind", ["mem0", "vector", "sqlite"])
+def test_delayed_summarization_after_erasure_and_retry_cannot_recreate_erased_subject(backend_kind, tmp_path):
+    adapter, raw_texts = _make_race_backend(backend_kind, tmp_path)
+    vault = CustodyVault.ephemeral(adapter=adapter)
+    try:
+        vault.register_source(
+            "intake",
+            "Priya Raman works on triage routing, and prefers async handoffs. Dana Kim owns pharmacy inventory.",
+            span_mode="clause",
+        )
+        r_priya = vault.remember(
+            "Priya Raman works on triage routing.",
+            subjects=["priya"],
+            source_id="intake",
+            quote="Priya Raman works on triage routing",
+            metadata={"user_id": "priya"},
+        )
+        r_dana = vault.remember(
+            "Dana Kim owns pharmacy inventory.",
+            subjects=["dana"],
+            source_id="intake",
+            quote="Dana Kim owns pharmacy inventory.",
+            metadata={"user_id": "dana"},
+        )
+
+        # Summarization job reads sources and search hits BEFORE erasure
+        with vault.trace_turn():
+            pre_hits = vault.search("triage routing pharmacy inventory", limit=5)
+            assert len(pre_hits.hits) == 2
+
+            # Erasure completes and issues deletion receipt BEFORE the slow summarization job writes
+            cert = vault.erase(
+                "priya",
+                aliases=["Priya Raman"],
+                probes=["Where does Priya work?", "triage routing", "async handoffs"],
+            )
+            assert cert.battery_all_abstained is True
+
+            # 1) Delayed trace-attached summary + retry
+            for _ in range(2):
+                with pytest.raises(InvariantViolation):
+                    vault.remember(
+                        "Clinic handoff note: triage routing updated for next shift.",
+                        subjects=["team_acme"],
+                        metadata={"user_id": "team_acme"},
+                    )
+
+        # 2) Delayed explicit derived_from summary + retry
+        for _ in range(2):
+            with pytest.raises(InvariantViolation):
+                vault.remember(
+                    "Cross-team staffing digest",
+                    subjects=["team_acme"],
+                    derived_from=[r_priya.item.item_id, r_dana.item.item_id],
+                    metadata={"user_id": "team_acme"},
+                )
+
+        # 3) Delayed source-cited compound span summary + retry (redacted span blocks recreation)
+        for _ in range(2):
+            with pytest.raises(ValueError):
+                vault.remember(
+                    "Priya prefers async handoffs",
+                    subjects=["team_acme"],
+                    source_id="intake",
+                    leaf_index=0,
+                    metadata={"user_id": "team_acme"},
+                )
+
+        # 4) Delayed untagged summary mentioning erased subject content + retry
+        for _ in range(2):
+            with pytest.raises(TombstonedSubjectError):
+                vault.remember(
+                    "Shift digest: Priya Raman handles async handoffs.",
+                    subjects=["team_acme"],
+                    metadata={"user_id": "team_acme"},
+                )
+
+        # Raw store must hold ONLY Dana's unrelated content; zero leaked rows for Priya or delayed summaries
+        texts = raw_texts()
+        assert len(texts) == 1
+        assert "Dana Kim" in texts[0]
+        assert "Priya" not in " ".join(texts)
+
+        # Retrieval for erased subject abstains while unrelated user content & receipt still verify
+        assert vault.search("Priya").abstained
+        assert vault.search("triage routing").abstained
+        dana_res = vault.search("Dana pharmacy")
+        assert not dana_res.abstained
+        assert dana_res.hits[0].item_id == r_dana.item.item_id
+        assert dana_res.hits[0].receipt_verified is True
+        assert vault.verify_item_receipt(r_dana.item.item_id) is True
+
+        audit = verify_bundle(vault.export_bundle())
+        assert audit["ok"] is True
+    finally:
+        vault.close()
+        if hasattr(adapter, "close"):
+            adapter.close()
+
+
+class _BlockingMem0Adapter(Mem0Adapter):
+    """Wraps Mem0Adapter to simulate an async summarization call landing across an erasure barrier."""
+
+    def __init__(self, client: Any, *, before_write_barrier: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(client, **kwargs)
+        self._race = before_write_barrier
+
+    def upsert_detailed(
+        self,
+        *,
+        item_id: str,
+        text: str,
+        subjects: tuple[str, ...],
+        metadata: dict[str, Any],
+        vector=None,
+    ):
+        if self._race.get("arm_text") and self._race["arm_text"] in text:
+            self._race["arm_text"] = None
+            self._race["entered"].wait(timeout=5.0)
+            self._race["release"].wait(timeout=5.0)
+        return super().upsert_detailed(
+            item_id=item_id,
+            text=text,
+            subjects=subjects,
+            metadata=metadata,
+            vector=vector,
+        )
+
+
+@pytest.mark.parametrize("keystore_backend", ["file", "sqlite"])
+def test_cross_handle_midflight_barrier_race_and_retry(keystore_backend, tmp_path):
+    vault_dir = tmp_path / "vault"
+    key_dir = tmp_path / "keys"
+    strict = StrictMem0V2Mock()
+
+    race_state: dict[str, Any] = {
+        "arm_text": None,
+        "entered": threading.Barrier(2),
+        "release": threading.Barrier(2),
+    }
+
+    worker_adapter = _BlockingMem0Adapter(strict, before_write_barrier=race_state, search_threshold=0.1)
+    api_adapter = Mem0Adapter(strict, search_threshold=0.1)
+
+    v_api = CustodyVault.open(
+        vault_dir,
+        key_dir=key_dir,
+        adapter=api_adapter,
+        keystore_backend=keystore_backend,
+    )
+    v_worker = CustodyVault.open(
+        vault_dir,
+        key_dir=key_dir,
+        adapter=worker_adapter,
+        keystore_backend=keystore_backend,
+    )
+    try:
+        v_api.register_source(
+            "handoff",
+            "Priya works on oncology routing. Nina staffs pediatrics desk. Dana covers pharmacy.",
+        )
+        r_priya = v_api.remember(
+            "Priya works on oncology routing.",
+            subjects=["priya"],
+            source_id="handoff",
+            quote="Priya works on oncology routing.",
+            metadata={"user_id": "priya"},
+        )
+        r_nina = v_api.remember(
+            "Nina staffs pediatrics desk.",
+            subjects=["nina"],
+            source_id="handoff",
+            quote="Nina staffs pediatrics desk.",
+            metadata={"user_id": "nina"},
+        )
+        r_dana = v_api.remember(
+            "Dana covers pharmacy.",
+            subjects=["dana"],
+            source_id="handoff",
+            quote="Dana covers pharmacy.",
+            metadata={"user_id": "dana"},
+        )
+
+        # Refresh worker handle so it sees pre-erasure state (stale wrt upcoming erase!)
+        pre_search = v_worker.search("oncology routing")
+        assert len(pre_search.hits) == 1
+
+        # API handle erases Priya while worker handle holds stale state in RAM
+        cert = v_api.erase("priya", probes=["Where does Priya work?", "oncology routing"])
+        assert cert.battery_all_abstained is True
+        # File/SQLite KeyStore shreds must be immediately visible across separate vault handles!
+        assert v_worker.keystore.get_subject_key("priya") is None
+
+        # Stale worker attempts delayed write + retry BEFORE entering adapter: rejected without writing a row
+        rows_before = len(strict.rows)
+        for _ in range(2):
+            with pytest.raises(InvariantViolation):
+                v_worker.remember(
+                    "Delayed routing summary from stale worker",
+                    subjects=["team_acme"],
+                    derived_from=[r_priya.item.item_id],
+                    metadata={"user_id": "team_acme"},
+                )
+        assert len(strict.rows) == rows_before
+
+        # Unrelated user write on FileKeyStore must NOT resurrect shredded Priya keys on disk
+        v_worker.remember("Dana renewed ACLS certification.", subjects=["dana"], metadata={"user_id": "dana"})
+        assert v_api.keystore.get_subject_key("priya") is None
+        assert v_worker.keystore.get_subject_key("priya") is None
+
+        # True mid-flight Barrier race: worker passes pre-checks BEFORE erase("nina"), pauses mid-adapter,
+        # API finishes erase("nina") + issues certificate, worker finishes slow write -> OCC aborts & rolls back!
+        race_state["arm_text"] = "Mid-flight summary referencing pediatrics"
+        worker_exc: list[BaseException] = []
+
+        def _slow_job() -> None:
+            try:
+                v_worker.remember(
+                    "Mid-flight summary referencing pediatrics desk",
+                    subjects=["team_acme"],
+                    derived_from=[r_nina.item.item_id],
+                    metadata={"user_id": "team_acme"},
+                )
+            except BaseException as exc:
+                worker_exc.append(exc)
+
+        t = threading.Thread(target=_slow_job)
+        t.start()
+        race_state["entered"].wait(timeout=5.0)
+        nina_cert = v_api.erase("nina", probes=["Who staffs pediatrics?", "pediatrics desk"])
+        assert nina_cert.battery_all_abstained is True
+        race_state["release"].wait(timeout=5.0)
+        t.join(timeout=5.0)
+
+        assert len(worker_exc) == 1
+        assert isinstance(worker_exc[0], ConcurrentModificationError)
+        # Mid-flight row written by slow adapter call MUST have been rolled back immediately
+        assert all("Mid-flight summary" not in row["memory"] for row in strict.rows.values())
+
+        # Retry of the delayed mid-flight job ALSO fails closed without touching adapter
+        with pytest.raises(InvariantViolation):
+            v_worker.remember(
+                "Mid-flight summary referencing pediatrics desk",
+                subjects=["team_acme"],
+                derived_from=[r_nina.item.item_id],
+                metadata={"user_id": "team_acme"},
+            )
+        assert v_api.search("pediatrics").abstained
+        assert v_worker.search("pediatrics").abstained
+
+        # Meanwhile a mid-flight bystander retry referencing only Dana succeeds after OCC catch-up!
+        race_state["entered"].reset()
+        race_state["release"].reset()
+        v_api.remember("Rohan manages lab supplies.", subjects=["rohan"], metadata={"user_id": "rohan"})
+        race_state["arm_text"] = "Dana bystander concurrent note"
+        bystander_exc: list[BaseException] = []
+
+        def _slow_bystander() -> None:
+            try:
+                v_worker.remember(
+                    "Dana bystander concurrent note",
+                    subjects=["dana"],
+                    derived_from=[r_dana.item.item_id],
+                    metadata={"user_id": "dana"},
+                )
+            except BaseException as exc:
+                bystander_exc.append(exc)
+
+        t2 = threading.Thread(target=_slow_bystander)
+        t2.start()
+        race_state["entered"].wait(timeout=5.0)
+        v_api.erase("rohan", probes=["Who manages lab supplies?"])
+        race_state["release"].wait(timeout=5.0)
+        t2.join(timeout=5.0)
+        assert len(bystander_exc) == 1 and isinstance(bystander_exc[0], ConcurrentModificationError)
+
+        # Retry of unrelated bystander write succeeds cleanly!
+        retried_dana = v_worker.remember(
+            "Dana bystander concurrent note",
+            subjects=["dana"],
+            derived_from=[r_dana.item.item_id],
+            metadata={"user_id": "dana"},
+        )
+        assert not v_api.search("bystander concurrent").abstained
+        assert retried_dana.item.subjects == ("dana",)
+        assert v_api.verify_item_receipt(r_dana.item.item_id) is True
+    finally:
+        v_worker.close()
+        v_api.close()
+
+
+def test_committed_pre_erasure_event_id_retry_after_erasure_cannot_recreate_record():
+    strict = StrictMem0V2Mock()
+    vault = CustodyVault.ephemeral(adapter=Mem0Adapter(strict, search_threshold=0.1))
+    try:
+        r_priya = vault.remember(
+            "Priya works on billing.",
+            subjects=["priya"],
+            metadata={"user_id": "priya"},
+        )
+        vault.remember(
+            "Dana leads ops.",
+            subjects=["dana"],
+            metadata={"user_id": "dana"},
+            event_id="job-dana-1",
+        )
+        rows_before_retry = len(strict.rows)
+        # Live idempotent event_id retry must NOT create duplicate vendor records
+        idem_res = vault.remember(
+            "Dana leads ops.",
+            subjects=["dana"],
+            metadata={"user_id": "dana"},
+            event_id="job-dana-1",
+        )
+        assert len(strict.rows) == rows_before_retry
+        assert idem_res.item.text == "Dana leads ops."
+
+        vault.remember(
+            "Billing coverage shift note",
+            subjects=["team_acme"],
+            derived_from=[r_priya.item.item_id],
+            metadata={"user_id": "team_acme"},
+            event_id="job-sum-1",
+        )
+
+        vault.erase("priya", probes=["billing", "Priya"])
+        rows_after_erase = len(strict.rows)
+        assert rows_after_erase == 1
+
+        # Delayed queue retry of committed pre-erasure event_id must fail WITHOUT recreating Mem0 row
+        for kwargs in (
+            {"derived_from": [r_priya.item.item_id]},
+            {},
+        ):
+            with pytest.raises(TombstonedSubjectError):
+                vault.remember(
+                    "Billing coverage shift note",
+                    subjects=["team_acme"],
+                    metadata={"user_id": "team_acme"},
+                    event_id="job-sum-1",
+                    **kwargs,
+                )
+        assert len(strict.rows) == rows_after_erase
+        assert vault.search("Billing coverage").abstained
+        assert not vault.search("Dana leads").abstained
+    finally:
+        vault.close()

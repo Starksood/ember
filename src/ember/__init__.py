@@ -68,6 +68,7 @@ from .merkle import (
 from .receipts import Receipt, locate_span, mint_flat_receipt, mint_redactable_receipt
 from .records import ClosureManifest, ErasureCertificate, LedgerEvent, MemoryItem, SourceRecord
 from .reducer import (
+    ConcurrentModificationError,
     EmberState,
     ErasureIncomplete,
     InvariantViolation,
@@ -103,6 +104,7 @@ __all__ = [
     "CallbackAnchor",
     "ChromaAdapter",
     "ClosureManifest",
+    "ConcurrentModificationError",
     "CustodyVault",
     "DecryptionError",
     "ERASED_TOMBSTONE",

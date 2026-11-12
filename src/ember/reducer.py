@@ -29,6 +29,10 @@ class InvariantViolation(ReductionError):
     """Raised when an event references missing parents/sources or collides on IDs."""
 
 
+class ConcurrentModificationError(InvariantViolation):
+    """Raised when another writer advances the ledger concurrently during an optimistic operation."""
+
+
 class TombstonedSubjectError(ReductionError):
     """Raised fail-closed when attempting to ingest data for a previously erased subject."""
 

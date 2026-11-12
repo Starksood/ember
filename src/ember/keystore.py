@@ -115,6 +115,9 @@ class MemoryKeyStore(KeyStore):
         self._record_keys: dict[str, tuple[bytes, frozenset[str]]] = {}
         self._tombstone_secret = tombstone_secret or secrets.token_bytes(32)
 
+    def _before_access(self) -> None:
+        pass
+
     def _on_mutate(self) -> None:
         pass
 
@@ -122,6 +125,7 @@ class MemoryKeyStore(KeyStore):
         if not isinstance(subject_id, str) or not subject_id.strip():
             raise ValueError("subject_id must be a non-empty string")
         with self._lock:
+            self._before_access()
             key = self._subject_keys.get(subject_id)
             if key is None:
                 key = new_key()
@@ -131,6 +135,7 @@ class MemoryKeyStore(KeyStore):
 
     def get_subject_key(self, subject_id: str) -> bytes | None:
         with self._lock:
+            self._before_access()
             return self._subject_keys.get(subject_id)
 
     def create_record_key(self, record_id: str, subjects: Iterable[str]) -> bytes:
@@ -140,6 +145,7 @@ class MemoryKeyStore(KeyStore):
         if not owners:
             raise ValueError("a record key must be associated with at least one non-empty subject")
         with self._lock:
+            self._before_access()
             if record_id in self._record_keys:
                 key, _ = self._record_keys[record_id]
                 return key
@@ -150,6 +156,7 @@ class MemoryKeyStore(KeyStore):
 
     def get_record_key(self, record_id: str) -> bytes | None:
         with self._lock:
+            self._before_access()
             entry = self._record_keys.get(record_id)
             return entry[0] if entry is not None else None
 
@@ -157,6 +164,7 @@ class MemoryKeyStore(KeyStore):
         if not isinstance(subject_id, str) or not subject_id.strip():
             return ShredReport(subject_id=str(subject_id), subject_key_destroyed=False, record_keys_destroyed=0)
         with self._lock:
+            self._before_access()
             subject_destroyed = self._subject_keys.pop(subject_id, None) is not None
             doomed = [rid for rid, (_, owners) in self._record_keys.items() if subject_id in owners]
             for rid in doomed:
@@ -186,6 +194,7 @@ class MemoryKeyStore(KeyStore):
 
     def export_state(self) -> dict:
         with self._lock:
+            self._before_access()
             return {
                 "version": 1,
                 "tombstone_secret": base64.b64encode(self._tombstone_secret).decode("ascii"),
@@ -213,21 +222,71 @@ class MemoryKeyStore(KeyStore):
 
 
 class FileKeyStore(MemoryKeyStore):
-    """Atomic, 0o600 file-backed mutable KeyStore."""
+    """Atomic, 0o600 file-backed mutable KeyStore synced across handles/processes."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self._disk_sig: tuple[int, int, int] | None = None
         with _FILE_KEYSTORE_LOCK:
             if self.path.exists():
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
                 super().__init__(tombstone_secret=base64.b64decode(raw["tombstone_secret"]))
-                for sid, b64 in raw.get("subject_keys", {}).items():
-                    self._subject_keys[sid] = base64.b64decode(b64)
-                for rid, rec in raw.get("record_keys", {}).items():
-                    self._record_keys[rid] = (base64.b64decode(rec["key"]), frozenset(rec["subjects"]))
+                self._load_raw(raw)
+                self._disk_sig = self._stat_sig()
             else:
                 super().__init__()
                 self._persist()
+
+    def _stat_sig(self) -> tuple[int, int, int] | None:
+        try:
+            st = os.stat(self.path)
+            return (st.st_ino, st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            return None
+
+    def _load_raw(self, raw: dict) -> None:
+        self._tombstone_secret = base64.b64decode(raw["tombstone_secret"])
+        self._subject_keys = {
+            sid: base64.b64decode(b64) for sid, b64 in raw.get("subject_keys", {}).items()
+        }
+        self._record_keys = {
+            rid: (base64.b64decode(rec["key"]), frozenset(rec["subjects"]))
+            for rid, rec in raw.get("record_keys", {}).items()
+        }
+
+    def _sync_from_disk(self) -> None:
+        sig = self._stat_sig()
+        if sig is not None and sig != self._disk_sig:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            self._load_raw(raw)
+            self._disk_sig = sig
+
+    def _before_access(self) -> None:
+        self._sync_from_disk()
+
+    def get_or_create_subject_key(self, subject_id: str) -> bytes:
+        with _FILE_KEYSTORE_LOCK:
+            return super().get_or_create_subject_key(subject_id)
+
+    def get_subject_key(self, subject_id: str) -> bytes | None:
+        with _FILE_KEYSTORE_LOCK:
+            return super().get_subject_key(subject_id)
+
+    def create_record_key(self, record_id: str, subjects: Iterable[str]) -> bytes:
+        with _FILE_KEYSTORE_LOCK:
+            return super().create_record_key(record_id, subjects)
+
+    def get_record_key(self, record_id: str) -> bytes | None:
+        with _FILE_KEYSTORE_LOCK:
+            return super().get_record_key(record_id)
+
+    def shred_subject(self, subject_id: str) -> ShredReport:
+        with _FILE_KEYSTORE_LOCK:
+            return super().shred_subject(subject_id)
+
+    def export_state(self) -> dict:
+        with _FILE_KEYSTORE_LOCK:
+            return super().export_state()
 
     def _on_mutate(self) -> None:
         self._persist()
@@ -237,7 +296,25 @@ class FileKeyStore(MemoryKeyStore):
         tmp = self.path.with_name(
             f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(6)}.tmp"
         )
-        payload = json.dumps(self.export_state(), sort_keys=True, indent=2).encode("utf-8")
+        payload = json.dumps(
+            {
+                "version": 1,
+                "tombstone_secret": base64.b64encode(self._tombstone_secret).decode("ascii"),
+                "subject_keys": {
+                    sid: base64.b64encode(key).decode("ascii")
+                    for sid, key in sorted(self._subject_keys.items())
+                },
+                "record_keys": {
+                    rid: {
+                        "key": base64.b64encode(key).decode("ascii"),
+                        "subjects": sorted(owners),
+                    }
+                    for rid, (key, owners) in sorted(self._record_keys.items())
+                },
+            },
+            sort_keys=True,
+            indent=2,
+        ).encode("utf-8")
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
@@ -247,6 +324,7 @@ class FileKeyStore(MemoryKeyStore):
                 os.close(fd)
             os.replace(tmp, self.path)
             os.chmod(self.path, 0o600)
+            self._disk_sig = self._stat_sig()
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
@@ -286,8 +364,9 @@ class SQLiteKeyStore(KeyStore):
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=10.0)
         self._lock = threading.RLock()
+        self._conn.execute("PRAGMA busy_timeout = 10000")
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = FULL")
         self._conn.execute("PRAGMA foreign_keys = ON")

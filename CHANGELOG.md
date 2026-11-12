@@ -2,6 +2,14 @@
 
 All notable changes to `ember-custody` are documented here.
 
+## [Unreleased]
+
+### Added
+- **Optimistic Concurrency Control & Multi-Handle State Synchronization (`ember.vault`, `ember.ledger`, `ember.keystore`, `ember.reducer`):**
+  - Added `ConcurrentModificationError` (subclass of `InvariantViolation`, mapped to HTTP `409 Conflict` in `EmberHttpApp`) and `expected_seq` optimistic sequence verification on `SQLiteLedger.append()` / `PostgresLedger.append()` plus automatic rollback (`adapter.delete(added_ids)`) of in-flight adapter writes when an `erase()` commits concurrently.
+  - Added `CustodyVault._sync_state_from_ledger()` delta catch-up across vault handles sharing a persistent ledger, `get_event_by_id()` pre-upsert `event_id` idempotency/erasure validation before calling vendor `adapter.upsert()`, redacted-leaf validation on `ADD_ITEM` ledger appends, `FileKeyStore` on-disk change sync (`_sync_from_disk`) so cross-handle key shreds never stay cached or get resurrected, and SQLite `timeout=10.0` / `PRAGMA busy_timeout = 10000`.
+  - Added concurrency, stale-handle, `threading.Barrier` mid-flight TOCTOU race, and delayed-write retry tests across `Mem0Adapter`, `VectorStoreAdapter`, and `SQLiteStoreAdapter` (`tests/test_adapters.py`, `tests/test_reducer_ledger.py`).
+
 ## [0.2.0] — Phase 2: Fail-Proof Core, Production Integrations & Sidecar Ecosystem
 
 ### Added

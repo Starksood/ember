@@ -28,7 +28,14 @@ from typing import Any, Protocol, runtime_checkable
 from .keystore import KeyStore
 from .merkle import RedactableDoc
 from .records import LedgerEvent, MemoryItem, SourceRecord
-from .reducer import EmberState, apply_event, decrypt_item_metadata, decrypt_item_payload
+from .reducer import (
+    ConcurrentModificationError,
+    EmberState,
+    InvariantViolation,
+    apply_event,
+    decrypt_item_metadata,
+    decrypt_item_payload,
+)
 from .verify import (
     GENESIS_HASH,
     canonical_bytes,
@@ -43,6 +50,32 @@ class LedgerIntegrityError(ValueError):
 
 class IdempotencyConflict(ValueError):
     """Raised when an `event_id` is reused with different payload content."""
+
+
+def _validate_live_receipt_source(doc: RedactableDoc | None, receipt_meta: Any) -> None:
+    if doc is None or not isinstance(receipt_meta, dict):
+        return
+    leaf_idx_raw = receipt_meta.get("leaf_index")
+    if not isinstance(leaf_idx_raw, int) or isinstance(leaf_idx_raw, bool):
+        return
+    if leaf_idx_raw < 0 or leaf_idx_raw >= len(doc.entries):
+        raise InvariantViolation(
+            f"receipt leaf_index {leaf_idx_raw} out of range for source {doc.source_id!r}"
+        )
+    entry = doc.entries[leaf_idx_raw]
+    if entry.get("redacted"):
+        raise InvariantViolation(
+            f"refusing ADD_ITEM citing redacted source leaf {doc.source_id!r}[{leaf_idx_raw}]"
+        )
+    span_indices = receipt_meta.get("span_indices")
+    if isinstance(span_indices, list) and span_indices:
+        spans_by_idx = {int(sp["span_index"]): sp for sp in entry.get("spans", ())}
+        for si in span_indices:
+            sp = spans_by_idx.get(int(si))
+            if sp is not None and sp.get("redacted"):
+                raise InvariantViolation(
+                    f"refusing ADD_ITEM citing redacted source span {doc.source_id!r}[{leaf_idx_raw}:{si}]"
+                )
 
 
 @dataclass(frozen=True)
@@ -312,8 +345,9 @@ class SQLiteLedger:
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=10.0)
         self._lock = threading.RLock()
+        self._conn.execute("PRAGMA busy_timeout = 10000")
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = FULL")
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -367,6 +401,18 @@ class SQLiteLedger:
             ).fetchall()
             return [self._row_to_event(r) for r in rows]
 
+    def get_event_by_id(self, tenant_id: str, event_id: str) -> LedgerEvent | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT tenant_id, seq, event_id, kind, committed_at, payload_json, prev_hash, event_hash
+                FROM ledger_events
+                WHERE tenant_id = ? AND event_id = ?
+                """,
+                (tenant_id, event_id),
+            ).fetchone()
+            return self._row_to_event(row) if row is not None else None
+
     def tail(self, tenant_id: str = "default") -> tuple[str, int]:
         with self._lock:
             row = self._conn.execute(
@@ -395,8 +441,9 @@ class SQLiteLedger:
         current_state: EmberState | None = None,
         keystore: KeyStore | None = None,
         validate: bool = True,
+        expected_seq: int | None = None,
     ) -> tuple[LedgerEvent, bool, EmberState | None]:
-        """Atomically append one event, checking idempotency, optional reduction invariants, and chaining."""
+        """Atomically append one event, checking idempotency, OCC seq, invariants, and chaining."""
         payload_canon = canonical_bytes(payload).decode("utf-8")
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -420,6 +467,11 @@ class SQLiteLedger:
                     return ev, True, current_state
 
                 prev_hash, seq = self.tail(tenant_id)
+                if expected_seq is not None and seq != expected_seq:
+                    raise ConcurrentModificationError(
+                        f"concurrent ledger modification for tenant {tenant_id!r} "
+                        f"(expected seq {expected_seq}, ledger at seq {seq})"
+                    )
                 candidate = {
                     "seq": seq,
                     "tenant_id": tenant_id,
@@ -443,8 +495,19 @@ class SQLiteLedger:
 
                 next_state = current_state
                 if validate:
-                    base = current_state if current_state is not None else self.replay(tenant_id, keystore=keystore)
+                    base = (
+                        current_state
+                        if (current_state is not None and current_state.version == seq)
+                        else self.replay(tenant_id, keystore=keystore)
+                    )
                     next_state = apply_event(base, ev, keystore=keystore)
+                    if kind == "ADD_ITEM":
+                        rmeta = (payload.get("item") or {}).get("receipt_meta")
+                        if isinstance(rmeta, dict) and isinstance(rmeta.get("source_id"), str):
+                            _validate_live_receipt_source(
+                                self.get_document(tenant_id, rmeta["source_id"]),
+                                rmeta,
+                            )
 
                 self._conn.execute(
                     """
@@ -841,6 +904,22 @@ class PostgresLedger:
                 if hasattr(cur, "close"):
                     cur.close()
 
+    def get_event_by_id(self, tenant_id: str, event_id: str) -> LedgerEvent | None:
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                self._exec(
+                    cur,
+                    "SELECT tenant_id, seq, event_id, kind, committed_at, payload_json, prev_hash, event_hash "
+                    "FROM __EVENTS__ WHERE tenant_id = %s AND event_id = %s",
+                    (tenant_id, event_id),
+                )
+                row = cur.fetchone()
+                return self._row_to_event(row) if row is not None else None
+            finally:
+                if hasattr(cur, "close"):
+                    cur.close()
+
     def tail(self, tenant_id: str = "default") -> tuple[str, int]:
         with self._lock:
             cur = self._conn.cursor()
@@ -870,6 +949,7 @@ class PostgresLedger:
         current_state: EmberState | None = None,
         keystore: KeyStore | None = None,
         validate: bool = True,
+        expected_seq: int | None = None,
     ) -> tuple[LedgerEvent, bool, EmberState | None]:
         payload_canon = canonical_bytes(payload).decode("utf-8")
 
@@ -898,6 +978,11 @@ class PostgresLedger:
             )
             tail_row = cur.fetchone()
             prev_hash, seq = (tail_row[0], int(tail_row[1]) + 1) if tail_row else (GENESIS_HASH, 0)
+            if expected_seq is not None and seq != expected_seq:
+                raise ConcurrentModificationError(
+                    f"concurrent ledger modification for tenant {tenant_id!r} "
+                    f"(expected seq {expected_seq}, ledger at seq {seq})"
+                )
             candidate = {
                 "seq": seq,
                 "tenant_id": tenant_id,
@@ -921,8 +1006,26 @@ class PostgresLedger:
 
             next_state = current_state
             if validate:
-                base = current_state if current_state is not None else self.replay(tenant_id, keystore=keystore)
+                base = (
+                    current_state
+                    if (current_state is not None and current_state.version == seq)
+                    else self.replay(tenant_id, keystore=keystore)
+                )
                 next_state = apply_event(base, ev, keystore=keystore)
+                if kind == "ADD_ITEM":
+                    rmeta = (payload.get("item") or {}).get("receipt_meta")
+                    if isinstance(rmeta, dict) and isinstance(rmeta.get("source_id"), str):
+                        self._exec(
+                            cur,
+                            "SELECT doc_json FROM __DOCS__ WHERE tenant_id = %s AND source_id = %s",
+                            (tenant_id, rmeta["source_id"]),
+                        )
+                        doc_row = cur.fetchone()
+                        if doc_row is not None:
+                            _validate_live_receipt_source(
+                                RedactableDoc.from_dict(json.loads(doc_row[0])),
+                                rmeta,
+                            )
 
             self._exec(
                 cur,

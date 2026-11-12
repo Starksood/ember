@@ -140,6 +140,27 @@ def test_c1_http_sidecar_auth_tenant_limits_and_fail_closed(tmp_path: Path) -> N
     )
     assert st == 403
 
+    # ConcurrentModificationError -> 409 Conflict
+    from ember.reducer import ConcurrentModificationError as _ConcErr
+
+    orig_remember = vault.remember
+
+    def _raise_occ(*args, **kwargs):
+        raise _ConcErr("simulated concurrent writer")
+
+    vault.remember = _raise_occ  # type: ignore[method-assign]
+    try:
+        st, _, err_raw = app.handle_request(
+            "POST",
+            "/v1/remember",
+            json.dumps({"text": "Ben update", "subjects": ["ben"]}).encode(),
+            auth_hdrs,
+        )
+        assert st == 409
+        assert json.loads(err_raw)["error"] == "ConcurrentModificationError"
+    finally:
+        vault.remember = orig_remember  # type: ignore[method-assign]
+
     st, _, raw = app.handle_request("POST", "/v1/checkpoint", b"{}", auth_hdrs)
     assert st == 200
     assert json.loads(raw)["status"] == "checkpointed"

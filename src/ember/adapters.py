@@ -266,8 +266,9 @@ class SQLiteStoreAdapter:
     def __init__(self, path: str = ":memory:") -> None:
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=10.0)
         self._lock = threading.RLock()
+        self._conn.execute("PRAGMA busy_timeout = 10000")
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = FULL")
         self._conn.execute(

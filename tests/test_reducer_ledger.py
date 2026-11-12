@@ -8,6 +8,7 @@ import sqlite3
 import pytest
 
 from ember.ledger import IdempotencyConflict, LedgerIntegrityError, SQLiteLedger
+from ember.reducer import ConcurrentModificationError, InvariantViolation, TombstonedSubjectError
 from ember.vault import CustodyVault
 
 
@@ -115,3 +116,85 @@ def test_crash_replay_reconstructs_byte_identical_state(tmp_path):
     assert v2.state.digest() == digest_live
     assert v2.ledger.verify_chain(v2.tenant_id)[0] is True
     v2.close()
+
+
+def test_ledger_rejects_stale_state_occ_and_redacted_leaf_backfill(tmp_path):
+    v_writer = CustodyVault.open(tmp_path / "vault", key_dir=tmp_path / "keys")
+    v_reader = CustodyVault.open(tmp_path / "vault", key_dir=tmp_path / "keys")
+    try:
+        v_writer.register_source("s1", "Priya lives in Denver. Dana lives in Austin.")
+        v_writer.remember("Priya lives in Denver.", subjects=["priya"], source_id="s1", quote="Priya lives in Denver.")
+        v_writer.remember("Dana lives in Austin.", subjects=["dana"], source_id="s1", quote="Dana lives in Austin.")
+
+        # Refresh v_reader pre-erasure, then capture stale snapshot before v_writer erases Priya
+        v_reader.search("Denver")
+        stale_state = v_reader.state
+        stale_priya_item = next(it for it in stale_state.items.values() if "priya" in it.subjects)
+        stale_payload = {
+            "item": {
+                **stale_priya_item.ledger_payload(),
+                "item_id": "item_stale_injection",
+                "receipt_meta": {
+                    "source_id": "s1",
+                    "flat_doc_hash": stale_state.sources["s1"].flat_doc_hash,
+                    "byte_start": 0,
+                    "byte_end": 22,
+                    "merkle_root": stale_state.sources["s1"].merkle_root,
+                    "leaf_index": 0,
+                    "leaf_count": 2,
+                    "proof": [],
+                },
+            }
+        }
+
+        v_writer.erase("priya", probes=["Denver"])
+
+        # 1) Passing expected_seq from stale reader must raise ConcurrentModificationError
+        with pytest.raises(ConcurrentModificationError):
+            v_writer.ledger.append(
+                tenant_id=v_writer.tenant_id,
+                event_id="evt_occ_stale",
+                kind="ADD_ITEM",
+                committed_at="2026-11-12T00:00:00Z",
+                payload=stale_payload,
+                current_state=stale_state,
+                keystore=v_writer.keystore,
+                validate=True,
+                expected_seq=stale_state.version,
+            )
+
+        # 2) Passing stale current_state WITHOUT expected_seq must still ignore stale version and enforce tombstones
+        with pytest.raises(TombstonedSubjectError):
+            v_writer.ledger.append(
+                tenant_id=v_writer.tenant_id,
+                event_id="evt_stale_bypass_attempt",
+                kind="ADD_ITEM",
+                committed_at="2026-11-12T00:00:00Z",
+                payload=stale_payload,
+                current_state=stale_state,
+                keystore=v_writer.keystore,
+                validate=True,
+            )
+
+        # 3) Even an untagged item citing a redacted leaf (s1[0]) directly at the ledger layer is rejected
+        untagged_redacted_leaf = {
+            "item": {
+                **stale_payload["item"],
+                "item_id": "item_redacted_leaf_cite",
+                "subject_tokens": [],
+            }
+        }
+        with pytest.raises(InvariantViolation):
+            v_writer.ledger.append(
+                tenant_id=v_writer.tenant_id,
+                event_id="evt_redacted_leaf_cite",
+                kind="ADD_ITEM",
+                committed_at="2026-11-12T00:00:00Z",
+                payload=untagged_redacted_leaf,
+                current_state=v_writer.state,
+                keystore=v_writer.keystore,
+                validate=True,
+            )
+    finally:
+        v_reader.close()
+        v_writer.close()

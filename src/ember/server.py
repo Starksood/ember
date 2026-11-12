@@ -14,7 +14,7 @@ from . import __version__
 from .crypto import DecryptionError
 from .kms import KmsOperationError
 from .ledger import IdempotencyConflict, LedgerIntegrityError
-from .reducer import ErasureIncomplete, InvariantViolation, TombstonedSubjectError
+from .reducer import ConcurrentModificationError, ErasureIncomplete, InvariantViolation, TombstonedSubjectError
 from .vault import CustodyVault
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -261,7 +261,7 @@ class EmberHttpApp:
             )
         except TombstonedSubjectError as exc:
             return 403, {"Content-Type": "application/json"}, _json_bytes({"error": type(exc).__name__, "detail": str(exc)})
-        except IdempotencyConflict as exc:
+        except (IdempotencyConflict, ConcurrentModificationError) as exc:
             return 409, {"Content-Type": "application/json"}, _json_bytes({"error": type(exc).__name__, "detail": str(exc)})
         except ErasureIncomplete as exc:
             return (

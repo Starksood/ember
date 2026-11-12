@@ -28,19 +28,27 @@ from .adapters import (
 )
 from .crypto import CIPHER_NAME, ERASED_TOMBSTONE, build_aad, encrypt_text
 from .keystore import FileKeyStore, KeyStore, MemoryKeyStore, SQLiteKeyStore
-from .ledger import LedgerBackend, SQLiteLedger
+from .ledger import (
+    IdempotencyConflict,
+    LedgerBackend,
+    LedgerIntegrityError,
+    SQLiteLedger,
+    _verify_delta_events,
+)
 from .merkle import ChunkMode, ChunkerFn, RedactableDoc, SpanChunkerFn, SpanMode, _entry_text
 from .receipts import Receipt, mint_redactable_receipt
-from .records import ErasureCertificate, MemoryItem, SourceRecord
+from .records import ClosureManifest, ErasureCertificate, LedgerEvent, MemoryItem, SourceRecord
 from .reducer import (
+    ConcurrentModificationError,
     EmberState,
     ErasureIncomplete,
     InvariantViolation,
     TombstonedSubjectError,
+    apply_event,
     compute_closure,
 )
 from .signing import Ed25519Signer, NullAnchor, TimestampAnchor, sign_certificate_dict
-from .verify import canonical_bytes, sha256_prefixed
+from .verify import GENESIS_HASH, canonical_bytes, sha256_prefixed
 
 _WORD_CHAR_NO_UNDERSCORE = re.compile(r"[^\W_]", re.UNICODE)
 _ACTIVE_TRACES: contextvars.ContextVar[dict[str, "TurnTrace"] | None] = contextvars.ContextVar(
@@ -383,10 +391,20 @@ class CustodyVault:
         self._embed_fn = _resolve_embed_fn(embedder)
         self.auto_checkpoint_every = auto_checkpoint_every
         self._ops_since_checkpoint = 0
+        append_sig = inspect.signature(self.ledger.append)
+        append_params = set(append_sig.parameters)
+        append_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in append_sig.parameters.values())
+        self._append_supports_expected_seq = "expected_seq" in append_params or append_varkw
         self.state: EmberState = self._replay_state(
             keystore=self.keystore,
             use_checkpoint=use_checkpoint,
         )
+        tail_hash, tail_next_seq = self.ledger.tail(self.tenant_id)
+        if tail_next_seq == self.state.version:
+            self._last_event_hash: str = tail_hash
+        else:
+            self._last_event_hash = GENESIS_HASH
+            self._sync_state_from_ledger()
         self._sync_adapter_scopes()
 
     def _replay_state(self, *, keystore: KeyStore | None, use_checkpoint: bool) -> EmberState:
@@ -400,9 +418,78 @@ class CustodyVault:
             kwargs["checkpoint_public_key"] = self.signer.public_key_hex
         return self.ledger.replay(self.tenant_id, **kwargs)
 
+    def _sync_state_from_ledger(self) -> bool:
+        """Catch up in-memory state if an external writer/handle appended new ledger events."""
+        tail_hash, ledger_next_seq = self.ledger.tail(self.tenant_id)
+        if ledger_next_seq == self.state.version and tail_hash == self._last_event_hash:
+            return False
+        if ledger_next_seq > self.state.version and hasattr(self.ledger, "events_after"):
+            delta = self.ledger.events_after(self.tenant_id, seq_exclusive=self.state.version - 1)
+            if delta:
+                try:
+                    _verify_delta_events(
+                        delta,
+                        tenant_id=self.tenant_id,
+                        expected_seq=self.state.version,
+                        expected_prev_hash=self._last_event_hash,
+                    )
+                    cur_state = self.state
+                    for ev in delta:
+                        cur_state = apply_event(cur_state, ev, keystore=self.keystore)
+                    self.state = cur_state
+                    self._last_event_hash = delta[-1].event_hash
+                    self._sync_adapter_scopes()
+                    return True
+                except (LedgerIntegrityError, InvariantViolation):
+                    pass
+        replayed = self.state
+        r_hash = self._last_event_hash
+        for _ in range(3):
+            replayed = self._replay_state(keystore=self.keystore, use_checkpoint=False)
+            r_hash, r_next_seq = self.ledger.tail(self.tenant_id)
+            if r_next_seq == replayed.version:
+                break
+        self.state = replayed
+        self._last_event_hash = r_hash
+        self._sync_adapter_scopes()
+        return True
+
+    def _get_event_by_id(self, event_id: str) -> LedgerEvent | None:
+        getter = getattr(self.ledger, "get_event_by_id", None)
+        if callable(getter):
+            return getter(self.tenant_id, event_id)
+        for ev in self.ledger.events(self.tenant_id):
+            if ev.event_id == event_id:
+                return ev
+        return None
+
+    def _append_ledger(
+        self,
+        *,
+        event_id: str,
+        kind: str,
+        committed_at: str,
+        payload: dict[str, Any],
+        expected_seq: int | None,
+    ) -> tuple[LedgerEvent, bool, EmberState | None]:
+        kwargs: dict[str, Any] = {
+            "tenant_id": self.tenant_id,
+            "event_id": event_id,
+            "kind": kind,
+            "committed_at": committed_at,
+            "payload": payload,
+            "current_state": self.state,
+            "keystore": self.keystore,
+            "validate": True,
+        }
+        if self._append_supports_expected_seq and expected_seq is not None:
+            kwargs["expected_seq"] = expected_seq
+        return self.ledger.append(**kwargs)
+
     def checkpoint(self) -> dict[str, Any]:
         """Persist an Ed25519-signed ciphertext-only state snapshot for O(delta) restarts."""
         with self._lock:
+            self._sync_state_from_ledger()
             save_fn = getattr(self.ledger, "save_checkpoint", None)
             if not callable(save_fn):
                 raise NotImplementedError(f"{type(self.ledger).__name__} does not support checkpoints")
@@ -601,6 +688,8 @@ class CustodyVault:
         if not isinstance(source_id, str) or not source_id.strip():
             raise ValueError("source_id must be a non-empty string")
         with self._lock:
+            self._sync_state_from_ledger()
+            expected_seq = self.state.version
             doc = RedactableDoc.from_text(text, source_id=source_id, mode=mode, span_mode=span_mode)
             raw_bytes = text.encode("utf-8")
             ts = ingested_at or _utc_now()
@@ -619,21 +708,21 @@ class CustodyVault:
                 validated_by=validated_by or "undeclared",
             )
             ev_id = event_id or f"src:{source_id}:{uuid.uuid4().hex[:8]}"
-            _, _, next_state = self.ledger.append(
-                tenant_id=self.tenant_id,
+            ev, idempotent, next_state = self._append_ledger(
                 event_id=ev_id,
                 kind="ADD_SOURCE",
                 committed_at=ts,
                 payload={"source": record.as_dict()},
-                current_state=self.state,
-                keystore=self.keystore,
-                validate=True,
+                expected_seq=expected_seq,
             )
             if next_state is None:
                 raise RuntimeError("ledger.append unexpectedly returned None state")
-            self.ledger.put_document(self.tenant_id, doc)
-            self.state = next_state
-            self._maybe_auto_checkpoint()
+            if self.ledger.get_document(self.tenant_id, source_id) is None or not idempotent:
+                self.ledger.put_document(self.tenant_id, doc)
+            if not idempotent:
+                self.state = next_state
+                self._last_event_hash = ev.event_hash
+                self._maybe_auto_checkpoint()
             return record, doc
 
     def _effective_owners(self, subjects: Sequence[str], derived_from: Sequence[str]) -> set[str]:
@@ -764,6 +853,56 @@ class CustodyVault:
         alias_tuple = tuple(dict.fromkeys(str(a) for a in aliases if str(a).strip()))
 
         with self._lock:
+            self._sync_state_from_ledger()
+            if event_id is not None:
+                existing_ev = self._get_event_by_id(event_id)
+                if existing_ev is not None:
+                    if existing_ev.kind != "ADD_ITEM":
+                        raise IdempotencyConflict(
+                            f"event_id {event_id!r} already committed for tenant {self.tenant_id!r} with different kind"
+                        )
+                    prev_payload = existing_ev.payload["item"]
+                    prev_item_id = str(prev_payload["item_id"])
+                    if item_id is not None and item_id != prev_item_id:
+                        raise IdempotencyConflict(
+                            f"event_id {event_id!r} already committed for item_id {prev_item_id!r}"
+                        )
+                    if committed_at is not None and committed_at != existing_ev.committed_at:
+                        raise IdempotencyConflict(
+                            f"event_id {event_id!r} already committed at {existing_ev.committed_at!r}"
+                        )
+                    prev_item = self.state.items.get(prev_item_id)
+                    if prev_item is None or prev_item.text == ERASED_TOMBSTONE:
+                        raise TombstonedSubjectError(
+                            f"refusing idempotent replay of event_id {event_id!r}: item {prev_item_id!r} was erased"
+                        )
+                    prev_meta_clean = {k: v for k, v in prev_item.metadata.items() if k != "ember_input_text"}
+                    expected_input_text = prev_item.metadata.get("ember_input_text", prev_item.text)
+                    req_meta = dict(metadata or {})
+                    prev_sid = prev_item.receipt_meta.get("source_id") if prev_item.receipt_meta else None
+                    prev_leaf = prev_item.receipt_meta.get("leaf_index") if prev_item.receipt_meta else None
+                    matches = (
+                        subj_tuple == prev_item.subjects
+                        and (text == expected_input_text or text == prev_item.text)
+                        and (req_meta == prev_meta_clean or req_meta == prev_item.metadata)
+                        and (quote is None or quote == prev_item.quote)
+                        and (source_id is None or source_id == prev_sid)
+                        and (leaf_index is None or leaf_index == prev_leaf)
+                        and (not derived_tuple or derived_tuple == prev_item.derived_from)
+                        and reconsent_id == prev_item.reconsent_id
+                    )
+                    if not matches:
+                        raise IdempotencyConflict(
+                            f"event_id {event_id!r} already committed for tenant {self.tenant_id!r} with different content"
+                        )
+                    return RememberResult(
+                        item=prev_item,
+                        receipt=self.receipt_for(prev_item),
+                        adapter_record_ids=prev_item.adapter_record_ids,
+                        event_hash=existing_ev.event_hash,
+                    )
+
+            expected_seq = self.state.version
             resolved_item_id = item_id or f"item_{uuid.uuid4().hex[:12]}"
             if event_id is None and resolved_item_id in self.state.items:
                 raise InvariantViolation(f"item already exists: {resolved_item_id!r}")
@@ -958,16 +1097,18 @@ class CustodyVault:
 
             ev_id = event_id or f"item:{resolved_item_id}"
             try:
-                ev, _, next_state = self.ledger.append(
-                    tenant_id=self.tenant_id,
+                ev, idempotent, next_state = self._append_ledger(
                     event_id=ev_id,
                     kind="ADD_ITEM",
                     committed_at=ts,
                     payload={"item": item_obj.ledger_payload()},
-                    current_state=self.state,
-                    keystore=self.keystore,
-                    validate=True,
+                    expected_seq=expected_seq,
                 )
+            except ConcurrentModificationError:
+                if added_ids:
+                    self.adapter.delete(added_ids)
+                self._sync_state_from_ledger()
+                raise
             except BaseException:
                 if added_ids:
                     self.adapter.delete(added_ids)
@@ -975,7 +1116,23 @@ class CustodyVault:
 
             if next_state is None:
                 raise RuntimeError("ledger.append unexpectedly returned None state")
+            if idempotent:
+                if added_ids:
+                    self.adapter.delete(added_ids)
+                self._sync_state_from_ledger()
+                live_item = self.state.items.get(str(ev.payload["item"]["item_id"]))
+                if live_item is None or live_item.text == ERASED_TOMBSTONE:
+                    raise TombstonedSubjectError(
+                        f"refusing idempotent replay of event_id {ev_id!r}: target item was erased"
+                    )
+                return RememberResult(
+                    item=live_item,
+                    receipt=self.receipt_for(live_item),
+                    adapter_record_ids=live_item.adapter_record_ids,
+                    event_hash=ev.event_hash,
+                )
             self.state = next_state
+            self._last_event_hash = ev.event_hash
             self._maybe_auto_checkpoint()
             if trace is not None:
                 trace.record_write(resolved_item_id)
@@ -1012,6 +1169,7 @@ class CustodyVault:
 
     def verify_item_receipt(self, item_id: str) -> bool:
         with self._lock:
+            self._sync_state_from_ledger()
             item = self.state.items.get(item_id)
             if item is None:
                 return False
@@ -1035,6 +1193,7 @@ class CustodyVault:
         if limit <= 0:
             return SearchResult(query=query, hits=(), filtered_orphans=0)
         with self._lock:
+            self._sync_state_from_ledger()
             adapter_filters, local_filters = self._translate_filters(filters)
             fetch_limit = max(limit * 4, limit) if local_filters else max(limit * 2, limit)
             supports_vec = _adapter_supports_vector(self.adapter)
@@ -1199,7 +1358,6 @@ class CustodyVault:
         marker_list = list(dict.fromkeys([subject_id, *alias_list, *(str(m) for m in markers if str(m).strip())]))
 
         with self._lock:
-            before_hash = self.state.digest()
             subject_tokens = tuple(
                 sorted(
                     {
@@ -1223,101 +1381,122 @@ class CustodyVault:
                 )
             )
 
-            # Gather any prior matching ERASE_SUBJECT closures (enables safe retry after transient adapter failures)
-            prior_events = self.ledger.events(self.tenant_id)
+            before_hash = ""
             prior_erase_found = False
             prior_item_ids: list[str] = []
             prior_derived_ids: list[str] = []
             prior_adapter_ids: list[str] = []
             prior_source_leaves: dict[str, set[int]] = {}
             prior_source_spans: dict[str, dict[int, set[int]]] = {}
-            for pev in prior_events:
-                if pev.kind != "ERASE_SUBJECT":
-                    continue
-                ev_tokens = {str(t) for t in pev.payload.get("subject_tokens", ()) if t}
-                if not (ev_tokens & token_set):
-                    continue
-                prior_erase_found = True
-                pclosure = pev.payload.get("closure") or {}
-                prior_item_ids.extend(str(x) for x in pclosure.get("item_ids", ()))
-                prior_derived_ids.extend(str(x) for x in pclosure.get("derived_invalidated", ()))
-                prior_adapter_ids.extend(str(x) for x in pclosure.get("adapter_record_ids", ()))
-                for sid, idxs in (pclosure.get("source_leaves_redacted") or {}).items():
-                    prior_source_leaves.setdefault(str(sid), set()).update(int(i) for i in idxs)
-                for sid, leaf_map in (pclosure.get("source_spans_redacted") or {}).items():
-                    target = prior_source_spans.setdefault(str(sid), {})
-                    for leaf_k, sp_idxs in leaf_map.items():
-                        target.setdefault(int(leaf_k), set()).update(int(i) for i in sp_idxs)
+            closure: ClosureManifest | None = None
+            effective_probes: list[str] = []
+            ev: LedgerEvent | None = None
+            next_state: EmberState | None = None
 
-            # Scan source docs for explicit leaf/span predicates if requested (in addition to cited closure leaves/spans)
-            extra_leaves: dict[str, list[int]] = {}
-            extra_spans: dict[str, dict[int, list[int]]] = {}
-            if leaf_predicate is not None or span_predicate is not None:
-                for sid in self.ledger.list_document_ids(self.tenant_id):
-                    doc = self.ledger.get_document(self.tenant_id, sid)
-                    if doc is None:
+            for attempt in range(4):
+                self._sync_state_from_ledger()
+                expected_seq = self.state.version
+                before_hash = self.state.digest()
+
+                # Gather any prior matching ERASE_SUBJECT closures (enables safe retry after transient adapter failures)
+                prior_events = self.ledger.events(self.tenant_id)
+                prior_erase_found = False
+                prior_item_ids = []
+                prior_derived_ids = []
+                prior_adapter_ids = []
+                prior_source_leaves = {}
+                prior_source_spans = {}
+                for pev in prior_events:
+                    if pev.kind != "ERASE_SUBJECT":
                         continue
-                    matched_leaves: list[int] = []
-                    matched_doc_spans: dict[int, list[int]] = {}
-                    for e in doc.entries:
-                        if e.get("redacted"):
+                    ev_tokens = {str(t) for t in pev.payload.get("subject_tokens", ()) if t}
+                    if not (ev_tokens & token_set):
+                        continue
+                    prior_erase_found = True
+                    pclosure = pev.payload.get("closure") or {}
+                    prior_item_ids.extend(str(x) for x in pclosure.get("item_ids", ()))
+                    prior_derived_ids.extend(str(x) for x in pclosure.get("derived_invalidated", ()))
+                    prior_adapter_ids.extend(str(x) for x in pclosure.get("adapter_record_ids", ()))
+                    for sid, idxs in (pclosure.get("source_leaves_redacted") or {}).items():
+                        prior_source_leaves.setdefault(str(sid), set()).update(int(i) for i in idxs)
+                    for sid, leaf_map in (pclosure.get("source_spans_redacted") or {}).items():
+                        target = prior_source_spans.setdefault(str(sid), {})
+                        for leaf_k, sp_idxs in leaf_map.items():
+                            target.setdefault(int(leaf_k), set()).update(int(i) for i in sp_idxs)
+
+                # Scan source docs for explicit leaf/span predicates if requested (in addition to cited closure leaves/spans)
+                extra_leaves: dict[str, list[int]] = {}
+                extra_spans: dict[str, dict[int, list[int]]] = {}
+                if leaf_predicate is not None or span_predicate is not None:
+                    for sid in self.ledger.list_document_ids(self.tenant_id):
+                        doc = self.ledger.get_document(self.tenant_id, sid)
+                        if doc is None:
                             continue
-                        l_idx = int(e["index"])
-                        if leaf_predicate is not None and leaf_predicate(_entry_text(e)):
-                            matched_leaves.append(l_idx)
-                        elif span_predicate is not None and "spans" in e:
-                            s_hits = [
-                                int(sp["span_index"])
-                                for sp in e["spans"]
-                                if not sp.get("redacted") and span_predicate(str(sp["text"]))
-                            ]
-                            if s_hits:
-                                matched_doc_spans[l_idx] = s_hits
-                    if matched_leaves:
-                        extra_leaves[sid] = matched_leaves
-                    if matched_doc_spans:
-                        extra_spans[sid] = matched_doc_spans
+                        matched_leaves: list[int] = []
+                        matched_doc_spans: dict[int, list[int]] = {}
+                        for e in doc.entries:
+                            if e.get("redacted"):
+                                continue
+                            l_idx = int(e["index"])
+                            if leaf_predicate is not None and leaf_predicate(_entry_text(e)):
+                                matched_leaves.append(l_idx)
+                            elif span_predicate is not None and "spans" in e:
+                                s_hits = [
+                                    int(sp["span_index"])
+                                    for sp in e["spans"]
+                                    if not sp.get("redacted") and span_predicate(str(sp["text"]))
+                                ]
+                                if s_hits:
+                                    matched_doc_spans[l_idx] = s_hits
+                        if matched_leaves:
+                            extra_leaves[sid] = matched_leaves
+                        if matched_doc_spans:
+                            extra_spans[sid] = matched_doc_spans
 
-            closure = compute_closure(
-                self.state,
-                subject_id,
-                subject_tokens=subject_tokens,
-                extra_source_leaves=extra_leaves or None,
-                extra_source_spans=extra_spans or None,
-            )
-
-            doomed_items = [self.state.items[iid] for iid in closure.item_ids if iid in self.state.items]
-            effective_probes = (
-                _synthesize_auto_probes(
-                    subject_id=subject_id,
-                    aliases=alias_list,
-                    markers=marker_list,
-                    doomed_items=doomed_items,
-                    explicit_probes=probe_list,
+                closure = compute_closure(
+                    self.state,
+                    subject_id,
+                    subject_tokens=subject_tokens,
+                    extra_source_leaves=extra_leaves or None,
+                    extra_source_spans=extra_spans or None,
                 )
-                if auto_probes
-                else probe_list
-            )
 
-            ts = committed_at or _utc_now()
-            erase_ev_id = f"erase:{subject_id}:{uuid.uuid4().hex[:8]}"
-            ev, _, next_state = self.ledger.append(
-                tenant_id=self.tenant_id,
-                event_id=erase_ev_id,
-                kind="ERASE_SUBJECT",
-                committed_at=ts,
-                payload={
-                    "subject_tokens": list(subject_tokens),
-                    "content_tokens": list(content_tokens),
-                    "closure": closure.as_dict(),
-                },
-                current_state=self.state,
-                keystore=self.keystore,
-                validate=True,
-            )
-            if next_state is None:
+                doomed_items = [self.state.items[iid] for iid in closure.item_ids if iid in self.state.items]
+                effective_probes = (
+                    _synthesize_auto_probes(
+                        subject_id=subject_id,
+                        aliases=alias_list,
+                        markers=marker_list,
+                        doomed_items=doomed_items,
+                        explicit_probes=probe_list,
+                    )
+                    if auto_probes
+                    else probe_list
+                )
+
+                ts = committed_at or _utc_now()
+                erase_ev_id = f"erase:{subject_id}:{uuid.uuid4().hex[:8]}"
+                try:
+                    ev, _, next_state = self._append_ledger(
+                        event_id=erase_ev_id,
+                        kind="ERASE_SUBJECT",
+                        committed_at=ts,
+                        payload={
+                            "subject_tokens": list(subject_tokens),
+                            "content_tokens": list(content_tokens),
+                            "closure": closure.as_dict(),
+                        },
+                        expected_seq=expected_seq,
+                    )
+                    break
+                except ConcurrentModificationError:
+                    if attempt >= 3:
+                        raise
+
+            if ev is None or closure is None or next_state is None:
                 raise RuntimeError("ledger.append unexpectedly returned None state")
             self.state = next_state
+            self._last_event_hash = ev.event_hash
 
             # 1. Local irreversible leaf/span redaction in DocumentStore FIRST (survives transient external failures)
             merged_source_leaves: dict[str, set[int]] = {k: set(v) for k, v in prior_source_leaves.items()}
@@ -1508,6 +1687,7 @@ class CustodyVault:
     def export_bundle(self, *, include_ledger: bool = True) -> dict[str, Any]:
         """Export self-contained redacted verification bundle checkable offline by `ember.verify`."""
         with self._lock:
+            self._sync_state_from_ledger()
             docs: dict[str, Any] = {}
             for sid in self.ledger.list_document_ids(self.tenant_id):
                 doc = self.ledger.get_document(self.tenant_id, sid)
