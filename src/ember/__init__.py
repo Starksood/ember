@@ -1,6 +1,6 @@
 """Ember: cryptographic custody, redactable Merkle receipts, and verifiable cascade erasure."""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from .adapters import (
     AdapterHit,

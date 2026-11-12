@@ -2,7 +2,7 @@
 
 All notable changes to `ember-custody` are documented here.
 
-## [Unreleased]
+## [0.2.1] — Concurrency Hardening & Delayed-Write Race Coverage
 
 ### Added
 - **Optimistic Concurrency Control & Multi-Handle State Synchronization (`ember.vault`, `ember.ledger`, `ember.keystore`, `ember.reducer`):**
